@@ -47,6 +47,7 @@ Early, pre-alpha. Implemented so far:
 | Duplicate-key safety in the mapping file: `yaml.safe_load`'s default silent last-one-wins for a repeated key (two `fields:` entries for the same source field, two entities with the same name, ...) now raises loudly at `load_mapping_file` instead — found live, writing a mapping that mapped one source field twice (once via `lookup:`, once as a raw passthrough copy): the first entry vanished with zero warning. Same footgun class as the scalar-iteration and bare-`null` bugs above | ✅ — a custom `yaml.SafeLoader` subclass overrides `construct_mapping` to detect the collision before pydantic ever sees the (already-collapsed) dict; live-confirmed both that the duplicate case now raises with a clear message and that the checked-in fixture and every mapping file used elsewhere in this README still load unaffected |
 | Confirmed capability, no new code needed: a source field can already be given *two* dispositions at once — mapped via `fields:` (e.g. `lookup:` + `on_missing: null`) **and** separately preserved raw via `unmapped.jsonb` — `EntityMapping` never enforced disposition-exclusivity. This directly answers a real design question (preserve a dangling reference's original value for forensics, without an FK to a value that isn't there) without adding a dedicated "legacy/raw copy" construct to the mapping DSL | ✅ — live-tested: a dangling `mcmUserId` landed as `user_id = NULL` (per `on_missing: null`) *and* `raw_payload = {"mcmUserId": "<original ObjectId hex>"}` in the same row, `validate` reporting zero mismatches |
 | Collection coverage (`validate-mapping --mongo-uri`): every collection actually present in the source database is now checked against the mapping file's entities and a new `excluded_collections: [...]` list — found by re-reading an earlier review verbatim rather than from memory: "a collection simply absent from the mapping file is never mentioned by any command... 'deliberately not migrating this' and 'forgot this existed' are indistinguishable." Non-blocking (a real database can hold plenty of genuinely irrelevant collections), but no longer invisible — a warning names exactly which collection has no disposition | ✅ — live-tested: an added `auditLogs` collection with no entity and no `excluded_collections` entry correctly produced a warning naming it; adding it to `excluded_collections` cleared the warning with no other change; a discriminator-filtered pair sharing one `source:` collection correctly counts as covered once, not flagged twice |
+| Live integration tests in CI (`tests/integration/`, its own CI job with real Mongo/Postgres service containers): the "live-tested" claims scattered through this table were previously proven once, by hand, in a dev session, and never re-checked — another old review, re-read verbatim: "consider capturing them as a compose-based integration test so CI proves them, not prose." A first slice: the full `validate-mapping`→`dry-run`→`migrate`→`validate` loop through the actual CLI (`CliRunner`, real Mongo + real Postgres, PRD §12's own worked example), and a genuine SIGKILL-mid-migrate-then-resume test — a real subprocess, killed via polling for actual partial progress (not a guessed sleep), asserting zero duplicates and zero gaps after resuming. Skipped cleanly (not failed) when `MONGO_URI`/`POSTGRES_URI` aren't set, so the plain unit-test suite stays exactly as fast as before | ✅ — both pass reliably against local Docker (3/3 repeated runs, no flakes) and now run in CI on every push |
 
 ## Try it
 
@@ -197,6 +198,15 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
 ruff check src tests
+```
+
+`pytest` alone (no env vars) runs the unit-test suite only — fast, no network, exactly what CI's matrixed `test` job runs. `tests/integration/` (real Mongo + real Postgres, including a genuine SIGKILL-and-resume) runs separately, in its own CI job, and is skipped cleanly by the command above unless `MONGO_URI`/`POSTGRES_URI` are set:
+
+```bash
+docker compose up -d
+MONGO_URI=mongodb://localhost:27017/app \
+POSTGRES_URI=postgresql://postgres:postgres@localhost:55432/app \
+pytest -q tests/integration
 ```
 
 ## License
