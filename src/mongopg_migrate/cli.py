@@ -5,7 +5,7 @@
     validate-mapping    -> §6 step 4 (structural + unmapped-field policy)
     dry-run             -> §6 step 5 (two-layer: fast in-memory pass + realistic temp-schema pass — see migrate/dryrun.py)
     migrate              -> §6 step 6 (entity-ordered COPY + id_map + checkpoint/resume — see migrate/load.py)
-    validate             -> §6 step 7 (NOT YET IMPLEMENTED — see report/validate.py)
+    validate             -> §6 step 7 (count diff + hashed-field sample diff — see report/validate.py)
 
 Connection strings follow the PRD §8 Docker example: MONGO_URI / POSTGRES_URI
 env vars, or --mongo-uri / --postgres-uri flags.
@@ -31,6 +31,8 @@ from mongopg_migrate.mapping.schema import (
 from mongopg_migrate.migrate import dryrun
 from mongopg_migrate.migrate.load import LoadError
 from mongopg_migrate.migrate.load import load as run_load
+from mongopg_migrate.report.validate import ValidationError
+from mongopg_migrate.report.validate import validate as run_validate
 
 MONGO_URI_OPTION = click.option(
     "--mongo-uri", envvar="MONGO_URI", required=True, help="Source MongoDB connection string."
@@ -302,10 +304,57 @@ def migrate_cmd(
             resumed = f", resumed after {r.resumed_from}" if r.resumed_from else ""
             click.echo(f"  {r.entity}: {r.rows_loaded} row(s) loaded{resumed}", err=True)
     click.echo(
-        "\nRun `validate` (PRD §6 step 7 — not yet implemented, see report/validate.py) to check "
-        "counts and value-level diffs before trusting this migration.",
+        "\nRun `validate` (PRD §6 step 7) to check counts and value-level diffs before "
+        "trusting this migration.",
         err=True,
     )
+
+
+@main.command("validate")
+@click.argument("mapping_path")
+@MONGO_URI_OPTION
+@POSTGRES_URI_OPTION
+@click.option("--pg-schema", default="public")
+@click.option(
+    "--sample-size",
+    type=int,
+    default=200,
+    help="Random rows per entity to re-derive and value-diff against the loaded row (PRD §9).",
+)
+def validate_cmd(
+    mapping_path: str, mongo_uri: str, postgres_uri: str, pg_schema: str, sample_size: int
+) -> None:
+    """PRD §6 step 7: post-migration count diff (incl. explode/junction
+    child tables) plus a hashed-field sample diff — row counts matching is
+    necessary but not sufficient; this also re-derives sampled rows' values
+    from Mongo and compares them to what actually landed in Postgres."""
+    mapping = load_mapping_file(mapping_path)
+
+    click.echo("Introspecting PostgreSQL...", err=True)
+    pg = introspect_postgres(postgres_uri, schema=pg_schema)
+
+    try:
+        report = run_validate(mapping, mongo_uri, postgres_uri, pg, sample_size=sample_size)
+    except ValidationError as e:
+        click.echo(f"ERROR: {e}", err=True)
+        sys.exit(1)
+
+    click.echo("Count diff:", err=True)
+    for c in report.count_diffs:
+        marker = "OK" if c.matches else "MISMATCH"
+        click.echo(f"  [{marker}] {c.entity} ({c.table}): mongo={c.mongo_count} postgres={c.postgres_count}", err=True)
+
+    click.echo(f"\nSample diff ({report.sampled_rows} row(s) sampled):", err=True)
+    if report.sample_diffs:
+        for d in report.sample_diffs:
+            click.echo(f"  [MISMATCH] {d.entity} source_id={d.source_id}: {', '.join(d.mismatched_fields)}", err=True)
+    else:
+        click.echo("  no mismatches", err=True)
+
+    if not report.ok:
+        click.echo("\nValidation FAILED — do not trust this migration as-is.", err=True)
+        sys.exit(1)
+    click.echo("\nOK — counts match and the sampled rows' values are correct.", err=True)
 
 
 if __name__ == "__main__":

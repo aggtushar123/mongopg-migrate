@@ -26,8 +26,8 @@ Early, pre-alpha. Implemented so far:
 | Rule-based candidate mapping proposer | ✅ |
 | Batch loader: entity-ordered COPY, `_mongopg.id_map`, per-batch checkpoint/resume, `truncate`/`append` | ✅ — live-tested including a real SIGKILL mid-run + resume (4002 docs, zero dupes/orphans) |
 | Dry-run: Layer A (in-memory type/null/lookup checks) + Layer B (real COPY+FK load into a disposable schema clone) | ✅ — live-tested: catches a real lookup miss before any write, leaves zero artifacts on success or failure |
-| CLI: `introspect`, `propose`, `validate-mapping`, `migrate`, `dry-run` | ✅ |
-| Post-migration validation (count + hashed-field diff) | 🚧 spec written, not implemented — see `report/validate.py` |
+| Post-migration validation: count diff (incl. explode/junction tables) + hashed-field sample diff | ✅ — live-tested: catches a real corrupted value with the exact field + row identified, clean data passes |
+| CLI: `introspect`, `propose`, `validate-mapping`, `migrate`, `dry-run`, `validate` | ✅ |
 | `--mode upsert` | 🚧 P1 per PRD §7 — `truncate`/`append` are P0 and implemented |
 
 ## Try it
@@ -56,6 +56,10 @@ mongopg-migrate migrate fixtures/mapping.example.yaml \
   --mongo-uri mongodb://localhost:27017/app \
   --postgres-uri postgresql://postgres:postgres@localhost:55432/app \
   --mode truncate
+
+mongopg-migrate validate fixtures/mapping.example.yaml \
+  --mongo-uri mongodb://localhost:27017/app \
+  --postgres-uri postgresql://postgres:postgres@localhost:55432/app
 ```
 
 `fixtures/mapping.example.yaml` is a hand-written, fully-worked mapping for
