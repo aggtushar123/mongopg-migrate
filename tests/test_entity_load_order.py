@@ -76,6 +76,43 @@ def test_order_respects_junction_child_fk_lookup():
     assert order.index("tags") < order.index("orders")
 
 
+def test_order_respects_nested_explode_lookup():
+    # Regression: a lookup one level deeper than the top explode level was
+    # invisible to entity_dependencies() — found live, testing directly
+    # against a real nested-explode mapping (facilities[].categoryParts[]).
+    # Before the fix: deps={'hospitals': set()}, order=['hospitals',
+    # 'zcategories'] — exactly backwards.
+    mapping = MappingFile(
+        entities={
+            "hospitals": _entity(
+                "hospitals",
+                explode={
+                    "facilities": ExplodeSpec(
+                        target="hospital_facilities",
+                        id_strategy=IdStrategy(type=IdStrategyType.OBJECTID_TO_UUID, source_field="facilityId"),
+                        parent_fk=ForeignKeyRef(target_field="hospital_id", references="hospitals.id"),
+                        explode={
+                            "categoryParts": ExplodeSpec(
+                                target="facility_category_parts",
+                                id_strategy=IdStrategy(type=IdStrategyType.SERIAL),
+                                parent_fk=ForeignKeyRef(
+                                    target_field="facility_id", references="hospital_facilities.id"
+                                ),
+                                fields={"categoryId": FieldSpec(target="category_id", lookup="zcategories")},
+                            )
+                        },
+                    )
+                },
+            ),
+            "zcategories": _entity("zcategories"),
+        }
+    )
+    deps = mapping.entity_dependencies()
+    assert deps["hospitals"] == {"zcategories"}
+    order = mapping.entity_load_order()
+    assert order.index("zcategories") < order.index("hospitals")
+
+
 def test_circular_lookup_dependency_raises():
     mapping = MappingFile(
         entities={

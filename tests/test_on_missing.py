@@ -149,11 +149,47 @@ class _FakeCursor:
         return self._fetchone_result
 
 
+class _SqlAwareFakeCursor:
+    """Distinguishes idmap.get()'s query (has 'source_id') from
+    idmap.has_any()'s (doesn't) by SQL text, so a fake conn can answer them
+    differently — needed once _resolve_lookup started checking has_any()
+    before applying an on_missing policy."""
+
+    def __init__(self, *, has_any_result: bool):
+        self._has_any_result = has_any_result
+        self._sql = ""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self._sql = sql
+
+    def fetchone(self):
+        if "source_id" in self._sql:
+            return None  # idmap.get(): this specific reference misses
+        return (1,) if self._has_any_result else None  # idmap.has_any()
+
+
 class _FakeMissConn:
-    """Simulates idmap.get() finding no row — a dangling reference."""
+    """Simulates a genuinely dangling individual reference: idmap.get()
+    finds no row for this source_id, but idmap.has_any() finds the entity
+    already has *other* rows — i.e. not a load-order problem."""
 
     def cursor(self):
-        return _FakeCursor(fetchone_result=None)
+        return _SqlAwareFakeCursor(has_any_result=True)
+
+
+class _FakeNeverLoadedConn:
+    """Simulates the load-order-bug case: idmap.get() misses AND
+    idmap.has_any() finds nothing at all for the entity — it hasn't loaded
+    a single row yet."""
+
+    def cursor(self):
+        return _SqlAwareFakeCursor(has_any_result=False)
 
 
 def _pg_schema_with_user_id(nullable: bool = True) -> PostgresSchema:
@@ -205,6 +241,52 @@ def test_resolve_lookup_skip_row_raises_skiprowerror_and_records_stat():
         )
     assert stats.skipped == {"bookings.mcmUserId": 1}
     assert stats.nulled == {}
+
+
+def test_resolve_lookup_null_refuses_when_entity_never_loaded():
+    # The deeper fix: on_missing=null answers "is this one reference OK to
+    # be missing", not "did the referenced entity ever load". A completely
+    # empty id_map for the referenced entity is far more likely a load-
+    # order bug (or a forgotten prerequisite run) than every single
+    # reference being independently dangling — refuse to apply the policy
+    # and raise loudly instead of silently writing NULL for what's really
+    # an ordering bug.
+    with pytest.raises(LoadError, match="load-order"):
+        _resolve_lookup(
+            _FakeNeverLoadedConn(), "users", "some-user-id", "bookings", "user_id", _pg_schema_with_user_id(),
+            on_missing=OnMissing.NULL,
+        )
+
+
+def test_resolve_lookup_skip_row_also_refuses_when_entity_never_loaded():
+    with pytest.raises(LoadError, match="load-order"):
+        _resolve_lookup(
+            _FakeNeverLoadedConn(), "users", "some-user-id", "bookings", "user_id", _pg_schema_with_user_id(),
+            on_missing=OnMissing.SKIP_ROW,
+        )
+
+
+def test_resolve_lookup_never_loaded_check_is_cached_per_entity():
+    conn = _FakeNeverLoadedConn()
+    cache: dict[str, bool] = {}
+    for _ in range(3):
+        with pytest.raises(LoadError, match="load-order"):
+            _resolve_lookup(
+                conn, "users", "some-user-id", "bookings", "user_id", _pg_schema_with_user_id(),
+                on_missing=OnMissing.NULL, unloaded_entity_cache=cache,
+            )
+    assert cache == {"users": True}
+
+
+def test_resolve_lookup_genuinely_dangling_reference_still_applies_null():
+    # The other half of the distinction: when the entity DOES have other
+    # rows (has_any=True), a miss on this one specific source_id is a real
+    # dangling reference, and on_missing=null still applies normally.
+    value = _resolve_lookup(
+        _FakeMissConn(), "users", "deleted-user-id", "bookings", "user_id", _pg_schema_with_user_id(),
+        on_missing=OnMissing.NULL,
+    )
+    assert value is None
 
 
 def test_resolve_lookup_none_source_value_is_not_a_miss():
