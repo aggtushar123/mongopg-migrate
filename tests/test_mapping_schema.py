@@ -118,3 +118,69 @@ def test_unmapped_field_policy_passes_when_everything_has_a_disposition():
     )
     issues = validate_against_mongo_schema(mapping, {"widgets": {"name", "internal_notes"}})
     assert not [i for i in issues if i.severity == "error"]
+
+
+# --- load_mapping_file: duplicate-key safety --------------------------------------------------
+#
+# yaml.safe_load's default behavior for a duplicate mapping key is silent
+# last-one-wins — found live, writing a mapping with the same source field
+# key twice under `fields:` (once resolved via lookup, once as a raw
+# passthrough copy): the first entry vanished with zero warning. Same
+# footgun class as the scalar-iteration and bare-`null` bugs already fixed
+# elsewhere in this tool.
+
+
+def test_load_mapping_file_rejects_duplicate_field_key(tmp_path):
+    p = tmp_path / "mapping.yaml"
+    p.write_text(
+        """
+        entities:
+          orders:
+            source: orders
+            target: orders
+            id_strategy: {type: objectid_to_uuid, source_field: _id}
+            fields:
+              mcmUserId: {target: user_id, lookup: mcm_user}
+              mcmUserId: {target: legacy_mcm_user_id}
+        """
+    )
+    with pytest.raises(ValueError, match="duplicate key 'mcmUserId'"):
+        load_mapping_file(p)
+
+
+def test_load_mapping_file_rejects_duplicate_entity_key(tmp_path):
+    p = tmp_path / "mapping.yaml"
+    p.write_text(
+        """
+        entities:
+          orders:
+            source: orders_v1
+            target: orders
+            id_strategy: {type: objectid_to_uuid, source_field: _id}
+          orders:
+            source: orders_v2
+            target: orders
+            id_strategy: {type: objectid_to_uuid, source_field: _id}
+        """
+    )
+    with pytest.raises(ValueError, match="duplicate key 'orders'"):
+        load_mapping_file(p)
+
+
+def test_load_mapping_file_accepts_a_clean_file_with_no_duplicates(tmp_path):
+    p = tmp_path / "mapping.yaml"
+    p.write_text(
+        """
+        entities:
+          orders:
+            source: orders
+            target: orders
+            id_strategy: {type: objectid_to_uuid, source_field: _id}
+            fields:
+              status: status
+              userId: {target: user_id, lookup: users}
+        """
+    )
+    mapping = load_mapping_file(p)
+    assert set(mapping.entities) == {"orders"}
+    assert set(mapping.entities["orders"].fields) == {"status", "userId"}

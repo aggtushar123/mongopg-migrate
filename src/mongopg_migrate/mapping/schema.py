@@ -503,9 +503,40 @@ class ValidationIssue(BaseModel):
     message: str
 
 
+class _DuplicateKeyCheckingLoader(yaml.SafeLoader):
+    """`yaml.safe_load`'s default behavior for a duplicate mapping key is
+    silent last-one-wins — found live, writing a mapping with the same
+    source field key twice under `fields:` (once as a resolved lookup,
+    once as a raw passthrough): the first entry vanished with no warning
+    at all. Same footgun class as the scalar-iteration and bare-`null`
+    bugs already fixed elsewhere in this tool — the natural, deliberate-
+    looking way to write it does something silently wrong. Applies
+    anywhere in the mapping file a YAML mapping key could collide:
+    entity names, field keys, explode/junction/unpivot names, and so on.
+    """
+
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    None,
+                    None,
+                    f"duplicate key {key!r} — only the last occurrence would otherwise silently "
+                    "survive, dropping every earlier one with no warning",
+                    key_node.start_mark,
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def load_mapping_file(path: str | Path) -> MappingFile:
     path = Path(path)
-    raw = yaml.safe_load(path.read_text())
+    try:
+        raw = yaml.load(path.read_text(), Loader=_DuplicateKeyCheckingLoader)
+    except yaml.constructor.ConstructorError as e:
+        raise ValueError(f"{path}: {e}") from e
     if not raw or "entities" not in raw:
         raise ValueError(f"{path}: mapping file must have a top-level `entities` key")
     return MappingFile.model_validate(raw)
