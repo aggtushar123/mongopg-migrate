@@ -275,6 +275,8 @@ def _collect_explode_rows(
                         stats=stats,
                     )
                 )
+            if exp.unmapped.jsonb:
+                row.append(_build_jsonb_payload(item, sorted(exp.unmapped.jsonb)))
         except SkipRowError:
             continue
         explode_rows[path].append(tuple(row))
@@ -587,14 +589,26 @@ def _load_entity_batches(
     # per-batch column layout (below) and the write-order loop at the end of
     # each batch, since _flatten_explode already returns parent-before-child.
     flattened_explode = _flatten_explode(entity.explode)
-    explode_columns = {
-        path: (
+    explode_columns: dict[str, list[str]] = {}
+    for path, exp in flattened_explode:
+        cols = (
             [exp.parent_fk.target_field]
             + ([exp.id_strategy.target_field] if exp.explode else [])
             + [exp.fields[k].target for k in exp.fields]
         )
-        for path, exp in flattened_explode
-    }
+        if exp.unmapped.jsonb:
+            # Same "jsonb is a real landing, not a label" guarantee as the
+            # top-level entity's own unmapped.jsonb, one level down —
+            # required by UnmappedPolicy validation whenever jsonb is non-empty.
+            exp_jsonb_column = exp.unmapped.jsonb_column
+            exp_table_schema = pg_schema.tables.get(exp.target)
+            if exp_table_schema is None or exp_jsonb_column not in exp_table_schema.columns:
+                raise LoadError(
+                    f"{entity_name}.{path}: unmapped.jsonb_column {exp_jsonb_column!r} is not a column "
+                    f"on {exp.target!r} — fix the mapping file before running migrate"
+                )
+            cols = cols + [exp_jsonb_column]
+        explode_columns[path] = cols
     # Persists across every batch of this entity's load, same reasoning as
     # the main `id_buffer` above — one int_sequence block reservation per
     # nested-explode-with-children level, not per document.

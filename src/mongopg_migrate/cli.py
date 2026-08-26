@@ -40,6 +40,7 @@ from mongopg_migrate.mapping.schema import (
     load_mapping_file,
     validate_against_mongo_schema,
     validate_collection_coverage,
+    validate_explode_field_coverage,
     validate_structure,
 )
 from mongopg_migrate.migrate import dryrun
@@ -251,6 +252,13 @@ def validate_mapping_cmd(mapping_path: str, mongo_uri: str | None, sample_size: 
         mongo_schemas = introspect_entities(mongo_uri, mapping, sample_size=sample_size)
         fields_by_entity = {name: schema.top_level_field_names() for name, schema in mongo_schemas.items()}
         issues += validate_against_mongo_schema(mapping, fields_by_entity)
+
+        # Same policy, one level down: a field *inside* an exploded array
+        # item with no disposition was previously silently dropped too —
+        # needs the *full* path set (introspection already tracks paths
+        # like "items[].discount"), not just top_level_field_names().
+        all_paths_by_entity = {name: set(schema.fields.keys()) for name, schema in mongo_schemas.items()}
+        issues += validate_explode_field_coverage(mapping, all_paths_by_entity)
 
         click.echo("Checking every database collection has a deliberate disposition...", err=True)
         all_collections = list_collection_names(mongo_uri)

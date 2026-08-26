@@ -177,6 +177,55 @@ class ForeignKeyRef(BaseModel):
         return self.references.split(".", 1)[1]
 
 
+class UnmappedPolicy(BaseModel):
+    """Explicit disposition for source fields not otherwise mapped.
+
+    PRD §7: "every source field must resolve to a column, an explicit
+    `drop`, or an explicit `jsonb` fallback — no silent drop." `jsonb` is
+    only a real landing, not a label, when `jsonb_column` names an actual
+    jsonb/json column on the target table: migrate/load.py serializes every
+    field in `jsonb` into one JSON object and writes it there. A mapping
+    with `jsonb` fields but no `jsonb_column` is rejected at validation
+    time — the earlier design let `jsonb` be indistinguishable from `drop`
+    at load time, which silently broke the field-level "zero silent data
+    loss" promise the disposition itself makes (PRD §9).
+
+    Also usable on an `ExplodeSpec` (not just the top-level `EntityMapping`)
+    for the exact same reason, one level down: a field inside an exploded
+    array item with no disposition was previously dropped with zero
+    warning — introspection already tracks nested paths like
+    `items[].discount` (CollectionSchema._walk_document), but nothing
+    checked them against the mapping until this existed.
+    """
+
+    drop: list[str] = Field(default_factory=list)
+    jsonb: list[str] = Field(default_factory=list)
+    jsonb_column: str | None = None
+
+    @property
+    def dispositioned(self) -> set[str]:
+        return set(self.drop) | set(self.jsonb)
+
+    @model_validator(mode="after")
+    def _no_overlap(self) -> UnmappedPolicy:
+        overlap = set(self.drop) & set(self.jsonb)
+        if overlap:
+            raise ValueError(f"fields listed in both drop and jsonb: {sorted(overlap)}")
+        return self
+
+    @model_validator(mode="after")
+    def _jsonb_column_matches_jsonb_fields(self) -> UnmappedPolicy:
+        if self.jsonb and not self.jsonb_column:
+            raise ValueError(
+                "unmapped.jsonb is non-empty but unmapped.jsonb_column is not set — "
+                "without a target column, these fields would silently be dropped at load "
+                "time instead of landing anywhere (PRD §9 zero-silent-data-loss)"
+            )
+        if self.jsonb_column and not self.jsonb:
+            raise ValueError("unmapped.jsonb_column is set but unmapped.jsonb is empty — nothing to land there")
+        return self
+
+
 class ExplodeSpec(BaseModel):
     """Embedded object/array field -> rows in an existing child table.
 
@@ -198,6 +247,11 @@ class ExplodeSpec(BaseModel):
     parent_fk: ForeignKeyRef
     fields: dict[str, FieldSpec] = Field(default_factory=dict)
     explode: dict[str, ExplodeSpec] = Field(default_factory=dict)
+    # Same P0 unmapped-field policy as EntityMapping's own `unmapped:`, one
+    # level down — a field inside this exploded array item with no
+    # disposition is otherwise silently dropped, exactly the bug class the
+    # top-level policy exists to prevent.
+    unmapped: UnmappedPolicy = Field(default_factory=UnmappedPolicy)
 
     @field_validator("fields", mode="before")
     @classmethod
@@ -215,6 +269,19 @@ class ExplodeSpec(BaseModel):
                 "identifies this embedded item (e.g. its own `_id` if Mongo assigned one)."
             )
         return self
+
+    def mapped_item_fields(self) -> set[str]:
+        """All field names *within one item of this exploded array* that
+        have a disposition — mirrors EntityMapping.mapped_source_fields()
+        one level down. `id_strategy.source_field` is auto-accounted for
+        the same reason `_id` is at the top level: only relevant (and only
+        required) when this level has nested children of its own, in which
+        case that field identifies the item rather than needing its own
+        `fields:`/`unmapped:` disposition."""
+        accounted = set(self.fields.keys()) | set(self.explode.keys()) | self.unmapped.dispositioned
+        if self.explode and self.id_strategy.source_field:
+            accounted.add(self.id_strategy.source_field)
+        return accounted
 
 
 ExplodeSpec.model_rebuild()
@@ -288,48 +355,6 @@ class UnpivotSpec(BaseModel):
         sources = [item.source_field for item in self.items]
         if len(sources) != len(set(sources)):
             raise ValueError(f"unpivot source_fields must be unique within one spec, got: {sources}")
-        return self
-
-
-class UnmappedPolicy(BaseModel):
-    """Explicit disposition for source fields not otherwise mapped.
-
-    PRD §7: "every source field must resolve to a column, an explicit
-    `drop`, or an explicit `jsonb` fallback — no silent drop." `jsonb` is
-    only a real landing, not a label, when `jsonb_column` names an actual
-    jsonb/json column on the target table: migrate/load.py serializes every
-    field in `jsonb` into one JSON object and writes it there. A mapping
-    with `jsonb` fields but no `jsonb_column` is rejected at validation
-    time — the earlier design let `jsonb` be indistinguishable from `drop`
-    at load time, which silently broke the field-level "zero silent data
-    loss" promise the disposition itself makes (PRD §9).
-    """
-
-    drop: list[str] = Field(default_factory=list)
-    jsonb: list[str] = Field(default_factory=list)
-    jsonb_column: str | None = None
-
-    @property
-    def dispositioned(self) -> set[str]:
-        return set(self.drop) | set(self.jsonb)
-
-    @model_validator(mode="after")
-    def _no_overlap(self) -> UnmappedPolicy:
-        overlap = set(self.drop) & set(self.jsonb)
-        if overlap:
-            raise ValueError(f"fields listed in both drop and jsonb: {sorted(overlap)}")
-        return self
-
-    @model_validator(mode="after")
-    def _jsonb_column_matches_jsonb_fields(self) -> UnmappedPolicy:
-        if self.jsonb and not self.jsonb_column:
-            raise ValueError(
-                "unmapped.jsonb is non-empty but unmapped.jsonb_column is not set — "
-                "without a target column, these fields would silently be dropped at load "
-                "time instead of landing anywhere (PRD §9 zero-silent-data-loss)"
-            )
-        if self.jsonb_column and not self.jsonb:
-            raise ValueError("unmapped.jsonb_column is set but unmapped.jsonb is empty — nothing to land there")
         return self
 
 
@@ -636,6 +661,88 @@ def validate_against_mongo_schema(
                         f"field {field!r} has no disposition — add it to `fields`, "
                         "`explode`, `junction`, or `unmapped.drop`/`unmapped.jsonb`"
                     ),
+                )
+            )
+    return issues
+
+
+def _field_names_at_path(all_field_paths: set[str], path_prefix: str) -> set[str]:
+    """Given the full flattened field-path set introspection produces (e.g.
+    {"items[].productId", "items[].qty", "items[].meta.color", ...}) and a
+    prefix like "items[]." (the exact prefix CollectionSchema._walk_document
+    uses when it recurses into an array-of-objects field), returns just the
+    immediate field names one level below that prefix — "productId", "qty",
+    "meta" for the example above, not "meta.color" — mirroring what
+    CollectionSchema.top_level_field_names() does for the very top of the
+    document."""
+    names: set[str] = set()
+    for path in all_field_paths:
+        if not path.startswith(path_prefix):
+            continue
+        rest = path[len(path_prefix) :]
+        cut = len(rest)
+        if "." in rest:
+            cut = min(cut, rest.index("."))
+        if "[]" in rest:
+            cut = min(cut, rest.index("[]"))
+        names.add(rest[:cut])
+    return names
+
+
+def _validate_explode_field_coverage(
+    exp: ExplodeSpec, all_field_paths: set[str], *, path_prefix: str, context: str
+) -> list[ValidationIssue]:
+    issues: list[ValidationIssue] = []
+    observed = _field_names_at_path(all_field_paths, path_prefix)
+    missing = observed - exp.mapped_item_fields()
+    for field in sorted(missing):
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                entity=context,
+                field=field,
+                message=(
+                    f"field {field!r} inside the exploded array at {path_prefix.rstrip('.')!r} has no "
+                    "disposition — add it to this explode level's `fields`, a nested `explode`, or "
+                    "`unmapped.drop`/`unmapped.jsonb`"
+                ),
+            )
+        )
+    for nested_ename, nested_exp in exp.explode.items():
+        issues.extend(
+            _validate_explode_field_coverage(
+                nested_exp, all_field_paths,
+                path_prefix=f"{path_prefix}{nested_ename}[].",
+                context=f"{context}.{nested_ename}",
+            )
+        )
+    return issues
+
+
+def validate_explode_field_coverage(
+    mapping: MappingFile, all_field_paths_by_entity: dict[str, set[str]]
+) -> list[ValidationIssue]:
+    """Extends the P0 unmapped-field policy (validate_against_mongo_schema,
+    above) one level down: a field *inside* an exploded array item with no
+    disposition was previously silently dropped, with no warning anywhere
+    — introspection has always tracked these nested paths (e.g.
+    "items[].discount"), nothing ever checked them against the mapping
+    until this existed. `all_field_paths_by_entity` maps entity name -> the
+    *full* set of dotted/bracketed field paths introspection observed
+    (CollectionSchema.fields.keys() — not just top_level_field_names()),
+    keyed the same way and for the same reason as
+    validate_against_mongo_schema's own parameter."""
+    issues: list[ValidationIssue] = []
+    for name, entity in mapping.entities.items():
+        if not entity.explode:
+            continue
+        all_paths = all_field_paths_by_entity.get(name)
+        if all_paths is None:
+            continue  # validate_against_mongo_schema already warns about this entity; don't warn twice
+        for ename, exp in entity.explode.items():
+            issues.extend(
+                _validate_explode_field_coverage(
+                    exp, all_paths, path_prefix=f"{ename}[].", context=f"{name}.{ename}"
                 )
             )
     return issues
