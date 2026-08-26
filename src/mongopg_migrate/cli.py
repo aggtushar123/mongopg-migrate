@@ -20,7 +20,11 @@ import sys
 import click
 import psycopg
 
-from mongopg_migrate.introspect.mongo import introspect_database, introspect_entities
+from mongopg_migrate.introspect.mongo import (
+    introspect_database,
+    introspect_entities,
+    list_collection_names,
+)
 from mongopg_migrate.introspect.postgres import CircularDependencyError, introspect_postgres
 from mongopg_migrate.mapping.llm_client import (
     DEFAULT_ANTHROPIC_MODEL,
@@ -35,6 +39,7 @@ from mongopg_migrate.mapping.schema import (
     dump_mapping_file,
     load_mapping_file,
     validate_against_mongo_schema,
+    validate_collection_coverage,
     validate_structure,
 )
 from mongopg_migrate.migrate import dryrun
@@ -247,15 +252,22 @@ def validate_mapping_cmd(mapping_path: str, mongo_uri: str | None, sample_size: 
         fields_by_entity = {name: schema.top_level_field_names() for name, schema in mongo_schemas.items()}
         issues += validate_against_mongo_schema(mapping, fields_by_entity)
 
+        click.echo("Checking every database collection has a deliberate disposition...", err=True)
+        all_collections = list_collection_names(mongo_uri)
+        issues += validate_collection_coverage(mapping, all_collections)
+
     errors = [i for i in issues if i.severity == "error"]
     warnings = [i for i in issues if i.severity == "warning"]
 
+    def _loc(issue) -> str:
+        if issue.entity is None:
+            return "database"
+        return f"{issue.entity}" + (f".{issue.field}" if issue.field else "")
+
     for i in warnings:
-        loc = f"{i.entity}" + (f".{i.field}" if i.field else "")
-        click.echo(f"WARNING [{loc}] {i.message}", err=True)
+        click.echo(f"WARNING [{_loc(i)}] {i.message}", err=True)
     for i in errors:
-        loc = f"{i.entity}" + (f".{i.field}" if i.field else "")
-        click.echo(f"ERROR [{loc}] {i.message}", err=True)
+        click.echo(f"ERROR [{_loc(i)}] {i.message}", err=True)
 
     if errors:
         click.echo(f"\n{len(errors)} error(s) — mapping file is not valid.", err=True)

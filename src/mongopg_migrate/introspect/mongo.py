@@ -240,6 +240,23 @@ def introspect_database(
         client.close()
 
 
+def list_collection_names(uri: str) -> set[str]:
+    """Every collection that actually exists in the source database —
+    deliberately separate from `introspect_database`/`introspect_entities`
+    (both of which only ever look at collections the mapping file already
+    knows about). Used by `validate_collection_coverage` (mapping/schema.py)
+    to catch a collection that's silently absent from the mapping file
+    entirely, not just an unmapped field inside one that's already there."""
+    client: MongoClient = MongoClient(uri)
+    try:
+        db = client.get_default_database()
+        if db is None:
+            raise ValueError("MONGO_URI must include a default database, e.g. mongodb://host:27017/mydb")
+        return set(db.list_collection_names())
+    finally:
+        client.close()
+
+
 def introspect_entities(
     uri: str, mapping: MappingFile, *, sample_size: int | None = None
 ) -> dict[str, CollectionSchema]:

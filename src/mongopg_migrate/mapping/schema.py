@@ -428,6 +428,19 @@ class MappingFile(BaseModel):
     # `external_entities` are assumed to live in the *same* database as
     # this run and are checked against this run's own id_map, as before.
     external_databases: dict[str, str] = Field(default_factory=dict)
+    # Collections that exist in the source database and are *deliberately*
+    # not migrated by this mapping file — e.g. `auditLogs`, a scratch
+    # collection, or one already covered by a separate run. The
+    # unmapped-field policy (PRD §7 P0) only ever looks inside an entity
+    # that's already in `entities:`; a collection simply absent from the
+    # file has never been mentioned by any command, at any severity —
+    # "deliberately not migrating this" and "forgot this collection
+    # existed" were genuinely indistinguishable. `validate_collection_
+    # coverage` (below) is what actually checks this against a live
+    # database; this list is how a collection earns its way out of that
+    # warning, on purpose, in a form that's checked into version control
+    # alongside the rest of the decision.
+    excluded_collections: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _external_databases_subset_of_external_entities(self) -> MappingFile:
@@ -626,3 +639,32 @@ def validate_against_mongo_schema(
                 )
             )
     return issues
+
+
+def validate_collection_coverage(mapping: MappingFile, all_collection_names: set[str]) -> list[ValidationIssue]:
+    """Every collection that actually exists in the source database should
+    have a deliberate disposition — mapped as some entity's `source:`, or
+    named in `excluded_collections` — not just be silently absent from the
+    mapping file. Unlike the P0 unmapped-*field* policy above (which is a
+    hard error: a field inside an already-migrated entity has no excuse to
+    be unaccounted for), this is a warning: a real Mongo database can hold
+    plenty of collections genuinely irrelevant to this migration (system/
+    internal collections, unrelated app data), and demanding every one be
+    explicitly listed would be pure noise for the common case. The point
+    isn't to force zero unmapped collections — it's to make "deliberately
+    not migrating this" and "forgot this collection existed" distinguishable,
+    which they weren't at all before this existed."""
+    accounted = {entity.source for entity in mapping.entities.values()} | set(mapping.excluded_collections)
+    missing = all_collection_names - accounted
+    return [
+        ValidationIssue(
+            severity="warning",
+            entity=None,
+            message=(
+                f"collection {name!r} exists in the source database but is not mapped by any "
+                "entity and not listed in `excluded_collections` — deliberately not migrating "
+                "it? Add it to `excluded_collections` to record that on purpose; otherwise map it."
+            ),
+        )
+        for name in sorted(missing)
+    ]

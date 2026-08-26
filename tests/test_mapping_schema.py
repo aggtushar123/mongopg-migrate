@@ -6,12 +6,14 @@ from pydantic import ValidationError
 from mongopg_migrate.mapping.schema import (
     EntityMapping,
     FieldSpec,
+    FilterSpec,
     IdStrategy,
     IdStrategyType,
     MappingFile,
     UnmappedPolicy,
     load_mapping_file,
     validate_against_mongo_schema,
+    validate_collection_coverage,
     validate_structure,
 )
 
@@ -165,6 +167,78 @@ def test_load_mapping_file_rejects_duplicate_entity_key(tmp_path):
     )
     with pytest.raises(ValueError, match="duplicate key 'orders'"):
         load_mapping_file(p)
+
+
+def _widgets_mapping() -> MappingFile:
+    return MappingFile(
+        entities={
+            "widgets": EntityMapping(
+                source="widgets",
+                target="widgets",
+                id_strategy=IdStrategy(type=IdStrategyType.PASSTHROUGH, source_field="_id"),
+                fields={"name": "name"},
+            )
+        }
+    )
+
+
+# --- validate_collection_coverage -------------------------------------------------------------
+#
+# "A collection simply absent from the mapping file is never mentioned by
+# any command. 'Deliberately not migrating this' and 'forgot this existed'
+# are indistinguishable." — found by testing directly against the tool's
+# actual validation surface: no existing check ever compares the mapping
+# file's entities against the full list of collections in the source
+# database, only fields *within* an already-mapped entity.
+
+
+def test_collection_coverage_flags_an_unmapped_collection():
+    mapping = _widgets_mapping()
+    issues = validate_collection_coverage(mapping, {"widgets", "auditLogs"})
+    assert len(issues) == 1
+    assert issues[0].severity == "warning"
+    assert issues[0].entity is None
+    assert "auditLogs" in issues[0].message
+
+
+def test_collection_coverage_clean_when_every_collection_is_mapped():
+    mapping = _widgets_mapping()
+    issues = validate_collection_coverage(mapping, {"widgets"})
+    assert issues == []
+
+
+def test_collection_coverage_respects_excluded_collections():
+    mapping = MappingFile(
+        entities=_widgets_mapping().entities,
+        excluded_collections=["auditLogs"],
+    )
+    issues = validate_collection_coverage(mapping, {"widgets", "auditLogs"})
+    assert issues == []
+
+
+def test_collection_coverage_multiple_entities_sharing_one_source_are_both_accounted():
+    # A discriminator-filtered pair sharing one source collection must not
+    # both count as "the same collection, still uncovered" — one shared
+    # `source:` value covers the collection regardless of how many entities
+    # split it.
+    mapping = MappingFile(
+        entities={
+            "payments_card": EntityMapping(
+                source="payments",
+                target="payments_card",
+                id_strategy=IdStrategy(type=IdStrategyType.PASSTHROUGH, source_field="_id"),
+                filter=FilterSpec(field="type", equals="card"),
+            ),
+            "payments_cash": EntityMapping(
+                source="payments",
+                target="payments_cash",
+                id_strategy=IdStrategy(type=IdStrategyType.PASSTHROUGH, source_field="_id"),
+                filter=FilterSpec(field="type", equals="cash"),
+            ),
+        }
+    )
+    issues = validate_collection_coverage(mapping, {"payments"})
+    assert issues == []
 
 
 def test_load_mapping_file_accepts_a_clean_file_with_no_duplicates(tmp_path):
