@@ -18,6 +18,8 @@ from bson import Decimal128, ObjectId
 from pymongo import MongoClient
 from pymongo.database import Database
 
+from mongopg_migrate.mapping.schema import MappingFile
+
 # --- sampling policy (PRD §10: sampling bias) --------------------------------
 
 FULL_SCAN_THRESHOLD = 5_000
@@ -174,16 +176,27 @@ def _detect_polymorphism(
 
 
 def introspect_collection(
-    db: Database, name: str, *, sample_size: int | None = None
+    db: Database, name: str, *, sample_size: int | None = None, mongo_filter: dict | None = None
 ) -> CollectionSchema:
+    """`mongo_filter`, when given, restricts introspection to documents
+    matching it (PRD §7 P0 discriminator filtering) — without it, sampling
+    a collection shared by multiple filtered entities sees every variant's
+    fields at once, so a field that only exists on a different discriminator
+    value looks "observed" for an entity that never actually has it. Note
+    this switches the count from `estimated_document_count()` (fast,
+    metadata-only, collection-wide) to `count_documents()` (a real scan) —
+    unavoidable since Mongo has no cheap way to estimate a filtered count.
+    """
     coll = db[name]
-    document_count = coll.estimated_document_count()
+    mongo_filter = mongo_filter or {}
+    document_count = coll.count_documents(mongo_filter) if mongo_filter else coll.estimated_document_count()
     n = sample_size if sample_size is not None else sample_size_for(document_count)
 
     if n >= document_count:
-        cursor = coll.find()
+        cursor = coll.find(mongo_filter)
     else:
-        cursor = coll.aggregate([{"$sample": {"size": n}}])
+        pipeline = ([{"$match": mongo_filter}] if mongo_filter else []) + [{"$sample": {"size": n}}]
+        cursor = coll.aggregate(pipeline)
 
     fields: dict[str, FieldStats] = {}
     signature_counts: Counter = Counter()
@@ -222,6 +235,35 @@ def introspect_database(
         names = collections or db.list_collection_names()
         return {
             name: introspect_collection(db, name, sample_size=sample_size) for name in names
+        }
+    finally:
+        client.close()
+
+
+def introspect_entities(
+    uri: str, mapping: MappingFile, *, sample_size: int | None = None
+) -> dict[str, CollectionSchema]:
+    """Like `introspect_database`, but keyed by *entity name* and filter-
+    aware: samples `entity.source` restricted to `entity.mongo_filter()`
+    (PRD §7 P0 discriminator filtering), not the whole shared collection.
+    This is what `validate-mapping`'s unmapped-field check should use for a
+    mapping with any `filter`-bearing entity — `introspect_database`, keyed
+    by collection name, can't even represent two entities sharing one
+    source collection, let alone sample them separately.
+    """
+    client: MongoClient = MongoClient(uri)
+    try:
+        db = client.get_default_database()
+        if db is None:
+            raise ValueError(
+                "MONGO_URI must include a default database, e.g. "
+                "mongodb://host:27017/mydb"
+            )
+        return {
+            name: introspect_collection(
+                db, entity.source, sample_size=sample_size, mongo_filter=entity.mongo_filter()
+            )
+            for name, entity in mapping.entities.items()
         }
     finally:
         client.close()

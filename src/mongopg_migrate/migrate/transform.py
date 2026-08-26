@@ -19,6 +19,7 @@ language.
 from __future__ import annotations
 
 import datetime
+import decimal
 from typing import Any
 
 
@@ -79,3 +80,32 @@ def _cast_timestamptz(value: Any) -> datetime.datetime:
         parsed = datetime.datetime.fromisoformat(value)
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.UTC)
     raise TransformError(f"cast_timestamptz: cannot cast {value!r} ({type(value).__name__})")
+
+
+def json_safe(value: Any) -> Any:
+    """Recursively converts a raw Mongo value into something `json`-native:
+    BSON types with no direct JSON equivalent (ObjectId, Decimal128, bytes,
+    ...) fall back to `str()`; dict/list recurse; everything already
+    JSON-native passes through unchanged. Naive datetimes (what pymongo
+    returns — Mongo has no other concept of a stored timezone) are stamped
+    UTC explicitly so the resulting JSON value isn't ambiguous to whatever
+    reads it later.
+
+    Shared by migrate/load.py (building the `unmapped.jsonb` payload to
+    write) and report/validate.py (recomputing the same payload from the
+    source document to sample-diff against what actually landed) — one
+    definition, so a fix to one path's serialization can't silently drift
+    from the other's expectations.
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [json_safe(v) for v in value]
+    if isinstance(value, datetime.datetime):
+        aware = value if value.tzinfo else value.replace(tzinfo=datetime.UTC)
+        return aware.isoformat()
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    return str(value)

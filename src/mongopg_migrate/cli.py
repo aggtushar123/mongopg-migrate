@@ -20,7 +20,7 @@ import sys
 import click
 import psycopg
 
-from mongopg_migrate.introspect.mongo import introspect_database
+from mongopg_migrate.introspect.mongo import introspect_database, introspect_entities
 from mongopg_migrate.introspect.postgres import CircularDependencyError, introspect_postgres
 from mongopg_migrate.mapping.llm_client import (
     DEFAULT_ANTHROPIC_MODEL,
@@ -235,13 +235,16 @@ def validate_mapping_cmd(mapping_path: str, mongo_uri: str | None, sample_size: 
 
     if mongo_uri:
         click.echo("Introspecting MongoDB to check unmapped-field policy...", err=True)
-        sources = {e.source for e in mapping.entities.values()}
-        mongo_schemas = introspect_database(mongo_uri, collections=list(sources), sample_size=sample_size)
-        fields_by_entity = {
-            name: mongo_schemas[e.source].top_level_field_names()
-            for name, e in mapping.entities.items()
-            if e.source in mongo_schemas
-        }
+        # introspect_entities, not introspect_database: it samples each
+        # entity's own `entity.mongo_filter()`-restricted view of its source
+        # collection, keyed by entity name — introspect_database samples once
+        # per unique collection *name*, which can't even represent two
+        # filtered entities sharing one source collection, let alone sample
+        # them separately (a field only present on a different discriminator
+        # value would otherwise look "observed" for an entity that never
+        # actually has it).
+        mongo_schemas = introspect_entities(mongo_uri, mapping, sample_size=sample_size)
+        fields_by_entity = {name: schema.top_level_field_names() for name, schema in mongo_schemas.items()}
         issues += validate_against_mongo_schema(mapping, fields_by_entity)
 
     errors = [i for i in issues if i.severity == "error"]

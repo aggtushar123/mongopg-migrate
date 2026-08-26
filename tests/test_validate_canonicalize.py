@@ -58,3 +58,26 @@ def test_lookup_missing_sentinel_never_equals_anything():
 
     assert not _values_equal(_LOOKUP_MISSING, None)
     assert not _values_equal(_LOOKUP_MISSING, _LOOKUP_MISSING)
+
+
+def test_row_hash_unaffected_by_jsonb_dict_key_order():
+    # Regression: Postgres's jsonb storage does not preserve key insertion
+    # order. == doesn't care, but repr() (what _row_hash hashes) does — a
+    # value-identical jsonb blob read back with reordered keys must not
+    # look like a mismatch purely from that reordering.
+    recomputed = {"color": "red", "weight_kg": 1.5}
+    actual_from_postgres = {"weight_kg": 1.5, "color": "red"}  # same content, different order
+    assert _row_hash([recomputed]) == _row_hash([actual_from_postgres])
+
+
+def test_row_hash_still_catches_a_real_jsonb_value_difference():
+    a = {"color": "red", "weight_kg": 1.5}
+    b = {"color": "blue", "weight_kg": 1.5}
+    assert _row_hash([a]) != _row_hash([b])
+
+
+def test_nested_dict_key_order_also_canonicalizes():
+    a = {"outer": {"a": 1, "b": 2}}
+    b = {"outer": {"b": 2, "a": 1}}
+    assert _canonicalize(a) == _canonicalize(b)
+    assert _row_hash([a]) == _row_hash([b])

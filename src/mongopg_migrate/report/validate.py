@@ -18,10 +18,17 @@ sufficient; values must be checked too."
    transform bugs, truncated types, and silent coercion that a count alone
    would miss (PRD §9 "Zero silent data loss").
 
+The sample diff also covers `unmapped.jsonb` (PRD §9 zero-silent-data-loss
+applies to the jsonb landing too, not just mapped columns): the same
+`migrate.transform.json_safe()` used to build the payload at load time
+recomputes it here from the source document, compared against whatever
+Postgres actually has in `unmapped.jsonb_column`.
+
 Known, stated scope limit (no silent narrowing): the sample diff checks
-each entity's own mapped fields, not its `explode`/`junction` child rows —
-count diff already covers those at the row-count level; per-field sampling
-of child rows is a reasonable future extension, not done here.
+each entity's own mapped fields and its jsonb payload, not `explode`/
+`junction` child rows — count diff already covers those at the row-count
+level; per-field sampling of child rows is a reasonable future extension,
+not done here.
 """
 
 from __future__ import annotations
@@ -40,7 +47,7 @@ from pymongo.database import Database
 from mongopg_migrate.introspect.postgres import PostgresSchema
 from mongopg_migrate.mapping.schema import EntityMapping, FieldSpec, MappingFile
 from mongopg_migrate.migrate import idmap
-from mongopg_migrate.migrate.transform import apply_default, apply_transform, get_nested
+from mongopg_migrate.migrate.transform import apply_default, apply_transform, get_nested, json_safe
 
 DEFAULT_SAMPLE_SIZE = 200
 
@@ -150,7 +157,12 @@ def _canonicalize(value: Any) -> Any:
     just for `==`: a `numeric` column's scale can make Postgres return
     `Decimal('19.990000')` where the recomputed value is `Decimal('19.99')`
     — equal by `==`, but `repr()` (what `_row_hash` hashes) differs unless
-    both are normalized to the same minimal-coefficient form first.
+    both are normalized to the same minimal-coefficient form first. The
+    same reasoning extends to dict/list (the `unmapped.jsonb` payload):
+    `==` doesn't care about dict key order, but `repr()` does — Postgres's
+    jsonb storage does not preserve the original key insertion order, so
+    without sorting keys here, a value-identical jsonb blob could still
+    hash differently purely from key reordering and look like a mismatch.
     """
     if value is None or isinstance(value, bool):
         return value
@@ -160,6 +172,10 @@ def _canonicalize(value: Any) -> Any:
         return str(value)
     if isinstance(value, datetime.datetime):
         return value.astimezone(datetime.UTC).isoformat()
+    if isinstance(value, dict):
+        return {k: _canonicalize(v) for k, v in sorted(value.items())}
+    if isinstance(value, list):
+        return [_canonicalize(v) for v in value]
     return value
 
 
@@ -220,10 +236,15 @@ def _sample_diffs(
     total_sampled = 0
 
     for name, entity in mapping.entities.items():
-        if not entity.fields:
-            continue
         field_keys = list(entity.fields.keys())
+        jsonb_fields = sorted(entity.unmapped.jsonb)
+        jsonb_column = entity.unmapped.jsonb_column
+        if not field_keys and not jsonb_fields:
+            continue
+
         pg_columns = [entity.fields[k].target for k in field_keys]
+        if jsonb_fields:
+            pg_columns = pg_columns + [jsonb_column]
         pk_col = entity.id_strategy.target_field
         pk_type = pg_schema.tables[entity.target].columns[pk_col].data_type.lower()
 
@@ -249,6 +270,8 @@ def _sample_diffs(
                 )
                 for k in field_keys
             ]
+            if jsonb_fields:
+                recomputed.append({f: json_safe(get_nested(doc, f)) for f in jsonb_fields})
 
             col_list = ", ".join(f'"{c}"' for c in pg_columns)
             with conn.cursor() as cur:
@@ -270,6 +293,8 @@ def _sample_diffs(
                 for i in range(len(field_keys))
                 if not _values_equal(recomputed[i], actual[i])
             ]
+            if jsonb_fields and not _values_equal(recomputed[-1], actual[-1]):
+                mismatched.append(jsonb_column)
             diffs.append(SampleDiff(entity=name, source_id=source_id_str, mismatched_fields=mismatched))
 
     return diffs, total_sampled

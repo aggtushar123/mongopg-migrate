@@ -58,8 +58,6 @@ found nothing new" rather than "didn't even look".
 
 from __future__ import annotations
 
-import datetime
-import decimal
 import itertools
 import uuid
 from dataclasses import dataclass, field
@@ -73,7 +71,7 @@ from mongopg_migrate.introspect.postgres import PostgresSchema
 from mongopg_migrate.mapping.schema import EntityMapping, FieldSpec, MappingFile
 from mongopg_migrate.migrate import checkpoint, idmap
 from mongopg_migrate.migrate.idstrategy import resolve_new_id
-from mongopg_migrate.migrate.transform import apply_default, apply_transform, get_nested
+from mongopg_migrate.migrate.transform import apply_default, apply_transform, get_nested, json_safe
 
 DEFAULT_BATCH_SIZE = 500
 SUPPORTED_MODES = ("truncate", "append", "upsert")
@@ -163,31 +161,8 @@ def _resolve_field_value(
     return value
 
 
-def _json_safe(value: object) -> object:
-    """Recursively converts a raw Mongo value into something `json`-native
-    (and hence safe inside a `Jsonb(...)` payload): BSON types with no
-    direct JSON equivalent (ObjectId, Decimal128, bytes, ...) fall back to
-    `str()`; dict/list recurse; everything already JSON-native passes
-    through unchanged."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {k: _json_safe(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, datetime.datetime):
-        # pymongo returns naive datetimes (implicitly UTC — Mongo has no other
-        # concept of a stored timezone); stamp that explicitly so the JSON
-        # value isn't ambiguous to whatever reads it later.
-        aware = value if value.tzinfo else value.replace(tzinfo=datetime.UTC)
-        return aware.isoformat()
-    if isinstance(value, decimal.Decimal):
-        return str(value)
-    return str(value)
-
-
 def _build_jsonb_payload(doc: dict, jsonb_fields: list[str]) -> Jsonb:
-    return Jsonb({f: _json_safe(get_nested(doc, f)) for f in jsonb_fields})
+    return Jsonb({f: json_safe(get_nested(doc, f)) for f in jsonb_fields})
 
 
 def _copy_rows(conn: psycopg.Connection, table: str, columns: list[str], rows: list[tuple]) -> None:
@@ -274,6 +249,11 @@ def _load_entity_batches(
     from bson.errors import InvalidId
     from bson.objectid import ObjectId
 
+    # Persists across every batch of this entity's load (not reset per
+    # batch) — an int_sequence id_strategy reserves a block of ids per
+    # generate_series() round trip instead of one nextval() per document.
+    id_buffer: dict[str, list[int]] = {}
+
     table = entity.target
     id_col = entity.id_strategy.target_field
     id_col_default = None
@@ -333,7 +313,7 @@ def _load_entity_batches(
         for doc in batch:
             source_id = doc["_id"]
             resolved = resolve_new_id(
-                entity.id_strategy, source_id, conn=conn, column_default=id_col_default
+                entity.id_strategy, source_id, conn=conn, column_default=id_col_default, id_buffer=id_buffer
             )
 
             row = [resolved.column_value]
