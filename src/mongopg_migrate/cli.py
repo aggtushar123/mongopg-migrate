@@ -14,6 +14,7 @@ env vars, or --mongo-uri / --postgres-uri flags.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 import click
@@ -21,8 +22,12 @@ import psycopg
 
 from mongopg_migrate.introspect.mongo import introspect_database
 from mongopg_migrate.introspect.postgres import CircularDependencyError, introspect_postgres
-from mongopg_migrate.mapping.llm_client import DEFAULT_MODEL as DEFAULT_LLM_MODEL
-from mongopg_migrate.mapping.llm_client import AnthropicLLMClient
+from mongopg_migrate.mapping.llm_client import (
+    DEFAULT_ANTHROPIC_MODEL,
+    LLMClientError,
+    build_llm_client,
+)
+from mongopg_migrate.mapping.llm_client import PROVIDERS as LLM_PROVIDERS
 from mongopg_migrate.mapping.llm_propose import enrich_mapping_with_llm
 from mongopg_migrate.mapping.propose import propose_mapping
 from mongopg_migrate.mapping.schema import (
@@ -120,9 +125,37 @@ def introspect_cmd(mongo_uri: str, postgres_uri: str, sample_size: int | None, p
     default=False,
     help="Ask an LLM to suggest mappings for fields name-similarity couldn't resolve (PRD §7/§8 P1). "
     "Off by default. Sends only schema metadata (field names/types/shapes), never row data. "
-    "Requires `pip install mongopg-migrate[llm]` and Anthropic credentials.",
+    "Provider-agnostic — see --llm-provider.",
 )
-@click.option("--llm-model", default=DEFAULT_LLM_MODEL)
+@click.option(
+    "--llm-provider",
+    type=click.Choice(LLM_PROVIDERS),
+    default="anthropic",
+    help="'anthropic' uses the Anthropic API (pip install mongopg-migrate[llm]; credentials via "
+    "ANTHROPIC_API_KEY or `ant auth login`, or --llm-api-key-env). 'openai-compatible' speaks plain "
+    "HTTP to any server implementing the OpenAI chat-completions contract — OpenAI itself, Azure "
+    "OpenAI, or a local runtime (Ollama, vLLM, LM Studio, llama.cpp server, ...) — no extra package "
+    "required; needs --llm-base-url.",
+)
+@click.option(
+    "--llm-model",
+    default=None,
+    help=f"Defaults to {DEFAULT_ANTHROPIC_MODEL} for --llm-provider anthropic; required for openai-compatible "
+    "(there's no universally sane default across arbitrary local models).",
+)
+@click.option(
+    "--llm-base-url",
+    default=None,
+    help="Required for --llm-provider openai-compatible, e.g. https://api.openai.com/v1, or "
+    "http://localhost:11434/v1 for a local Ollama.",
+)
+@click.option(
+    "--llm-api-key-env",
+    default=None,
+    help="Env var to read the LLM API key from. Default: unset for anthropic (the SDK resolves "
+    "ANTHROPIC_API_KEY / `ant auth login` itself — this flag only overrides that); OPENAI_API_KEY "
+    "for openai-compatible. Many local servers (Ollama, LM Studio) need no key — leave unset.",
+)
 def propose_cmd(
     mongo_uri: str,
     postgres_uri: str,
@@ -130,7 +163,10 @@ def propose_cmd(
     pg_schema: str,
     output: str,
     llm: bool,
-    llm_model: str,
+    llm_provider: str,
+    llm_model: str | None,
+    llm_base_url: str | None,
+    llm_api_key_env: str | None,
 ) -> None:
     """Generate a candidate mapping.yaml (PRD §6 step 3). Always review and
     edit before running `migrate` — nothing here is auto-confirmed."""
@@ -142,8 +178,30 @@ def propose_cmd(
     mapping, issues = propose_mapping(mongo_schemas, pg)
 
     if llm:
-        click.echo("Asking LLM for suggestions on fields name-similarity couldn't resolve...", err=True)
-        llm_client = AnthropicLLMClient(model=llm_model)
+        resolved_model = llm_model or (DEFAULT_ANTHROPIC_MODEL if llm_provider == "anthropic" else None)
+        if not resolved_model:
+            click.echo(f"ERROR: --llm-model is required for --llm-provider {llm_provider!r}.", err=True)
+            sys.exit(1)
+
+        api_key = None
+        if llm_api_key_env:
+            api_key = os.environ.get(llm_api_key_env)
+            if api_key is None:
+                click.echo(f"WARNING: ${llm_api_key_env} is not set — proceeding without one.", err=True)
+        elif llm_provider == "openai-compatible":
+            api_key = os.environ.get("OPENAI_API_KEY")  # convention default; fine to be unset for local servers
+
+        try:
+            llm_client = build_llm_client(llm_provider, resolved_model, base_url=llm_base_url, api_key=api_key)
+        except LLMClientError as e:
+            click.echo(f"ERROR: {e}", err=True)
+            sys.exit(1)
+
+        click.echo(
+            f"Asking {llm_provider} ({resolved_model}) for suggestions on fields name-similarity "
+            "couldn't resolve...",
+            err=True,
+        )
         issues += enrich_mapping_with_llm(llm_client, mapping, mongo_schemas, pg)
 
     dump_mapping_file(mapping, output)

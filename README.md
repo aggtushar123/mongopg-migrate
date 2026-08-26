@@ -30,7 +30,7 @@ Early, pre-alpha. Implemented so far:
 | `--mode upsert`: staging table + `ON CONFLICT DO UPDATE` for the main entity and `junction` tables; `explode` children always plain-insert (no natural conflict key) | ✅ |
 | CLI: `introspect`, `propose`, `validate-mapping`, `migrate`, `dry-run`, `validate` | ✅ |
 | Docker image (primary distribution, PRD §8) | ✅ — live-tested: builds clean, every command run from inside the container against the fixture over the compose network |
-| LLM-assisted mapping suggestions (`propose --llm`, PRD §7 P1/§8): pluggable `LLMClient` seam, `AnthropicLLMClient` default, schema-metadata-only payload, never trusts a suggestion blindly | ✅ — **not** live-verified against a real Anthropic account (no credentials in this dev environment): unit-tested against a fake client, and `AnthropicLLMClient.suggest()` was exercised against the real API with a deliberately invalid key, confirming a genuine 401 (not a client-side SDK-usage error) — the request shape is right, but no real suggestion has been reviewed end-to-end yet |
+| LLM-assisted mapping suggestions (`propose --llm`, PRD §7 P1/§8): pluggable `LLMClient` seam, schema-metadata-only payload, never trusts a suggestion blindly | ✅ — provider-agnostic via `--llm-provider`: `anthropic` (Anthropic API) or `openai-compatible` (plain HTTP to any server speaking the OpenAI chat-completions contract — OpenAI, Azure OpenAI, Ollama, vLLM, LM Studio, llama.cpp server, ..., zero added dependency). `openai-compatible` is live-tested against a real local HTTP server (12 tests, genuine socket round-trips). `anthropic` is **not** live-verified end-to-end (no credentials in this dev environment): unit-tested against a fake client, and one real network call with a deliberately invalid key confirmed a genuine 401 from Anthropic's servers, not a client-side SDK-usage error |
 
 ## Try it
 
@@ -49,12 +49,25 @@ mongopg-migrate propose \
 
 # Optional: ask an LLM about fields propose couldn't confidently map on its own
 # (e.g. a rename like users.name -> display_name). Off by default; only field
-# names/types/shapes are sent, never row data. Requires:
-#   pip install "mongopg-migrate[llm]"   and   export ANTHROPIC_API_KEY=...
+# names/types/shapes are sent, never row data. Provider-agnostic:
+
+# ...via the Anthropic API — requires: pip install "mongopg-migrate[llm]"
+#    and export ANTHROPIC_API_KEY=... (or `ant auth login`)
 mongopg-migrate propose \
   --mongo-uri mongodb://localhost:27017/app \
   --postgres-uri postgresql://postgres:postgres@localhost:55432/app \
   -o mapping.yaml --llm
+
+# ...or any OpenAI-compatible server — OpenAI itself, Azure OpenAI, or a local
+#    runtime (Ollama, vLLM, LM Studio, llama.cpp server, ...). No extra
+#    package needed. Example against a local Ollama running llama3:
+mongopg-migrate propose \
+  --mongo-uri mongodb://localhost:27017/app \
+  --postgres-uri postgresql://postgres:postgres@localhost:55432/app \
+  -o mapping.yaml --llm \
+  --llm-provider openai-compatible \
+  --llm-base-url http://localhost:11434/v1 \
+  --llm-model llama3
 
 mongopg-migrate validate-mapping mapping.yaml \
   --mongo-uri mongodb://localhost:27017/app
