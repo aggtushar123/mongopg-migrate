@@ -1,0 +1,80 @@
+# Hand-confirmed mapping for the fixture demo (PRD §12 worked example,
+# adapted to the seed data in fixtures/mongo-seed/seed.js and the DDL in
+# fixtures/postgres-ddl/schema.sql). This is what `propose` should get most
+# of the way to automatically — check it against `mongopg-migrate propose`
+# output once that command has live databases to point at.
+
+entities:
+  users:
+    source: users
+    target: users
+    id_strategy:
+      type: objectid_to_uuid
+      source_field: _id
+      target_field: id
+    fields:
+      email: email
+      name: display_name
+    unmapped: {}
+
+  products:
+    source: products
+    target: products
+    id_strategy:
+      type: objectid_to_uuid
+      source_field: _id
+      target_field: id
+    fields:
+      sku: sku
+      name: name
+    unmapped: {}
+
+  tags:
+    source: tags
+    target: tags
+    id_strategy:
+      type: objectid_to_uuid
+      source_field: _id
+      target_field: id
+    fields:
+      label: label
+    unmapped: {}
+
+  orders:
+    source: orders
+    target: orders
+    id_strategy:
+      type: objectid_to_uuid
+      source_field: _id
+      target_field: id
+    fields:
+      status: status
+      createdAt:
+        target: created_at
+        transform: cast_timestamptz
+      userId:
+        target: user_id
+        lookup: users
+
+    explode:
+      items:
+        target: order_items
+        id_strategy:
+          type: serial
+        parent_fk:
+          target_field: order_id
+          references: orders.id
+        fields:
+          productId:
+            target: product_id
+            lookup: products
+          qty: qty
+          price: price
+
+    junction:
+      tagIds:
+        target: order_tags
+        parent_fk: { target_field: order_id, references: orders.id }
+        child_fk: { target_field: tag_id, references: tags.id, lookup: tags }
+
+    unmapped: {}

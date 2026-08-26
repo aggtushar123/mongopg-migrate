@@ -1,0 +1,35 @@
+# Local Mongo + Postgres fixture, per PRD §8: "a docker-compose.yml for
+# spinning up local Mongo/Postgres test instances to try the tool end-to-end
+# before pointing it at real data."
+#
+# Usage:
+#   docker compose up -d
+#   mongopg-migrate introspect \
+#     --mongo-uri mongodb://localhost:27017/app \
+#     --postgres-uri postgresql://postgres:postgres@localhost:55432/app
+
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: app
+    volumes:
+      - ./fixtures/mongo-seed:/docker-entrypoint-initdb.d:ro
+
+  postgres:
+    image: postgres:16
+    ports:
+      - "55432:5432"  # non-default host port: avoids clashing with a locally-running Postgres on 5432
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: app
+    volumes:
+      - ./fixtures/postgres-ddl:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 20
