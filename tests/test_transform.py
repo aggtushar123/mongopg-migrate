@@ -49,6 +49,45 @@ def test_cast_int_and_float_and_text_and_bool():
     assert apply_transform("cast_bool", 1) is True
 
 
+# --- cast_* on a list/dict: found live re-verifying the HealthRail
+# transcript's "arrays of plain scalars" note. int()/float() already raise
+# on a list on their own, but bool()/str() don't: bool([1, 2, 3]) is True
+# (any non-empty list is truthy) and str([1, 2, 3]) silently lands the
+# Python repr '[1, 2, 3]' in a text column — same footgun class as the
+# character-by-character scalar-iteration bug elsewhere in this tool.
+
+
+def test_cast_bool_on_a_list_raises_instead_of_using_python_truthiness():
+    with pytest.raises(TransformError, match="cannot cast a list"):
+        apply_transform("cast_bool", [1, 2, 3])
+
+
+def test_cast_bool_on_an_empty_list_still_raises():
+    # Especially important: an empty list is falsy, so a silent bool()
+    # coercion would produce a plausible-looking False instead of erroring.
+    with pytest.raises(TransformError, match="cannot cast a list"):
+        apply_transform("cast_bool", [])
+
+
+def test_cast_text_on_a_list_raises_instead_of_stringifying_the_repr():
+    with pytest.raises(TransformError, match="cannot cast a list"):
+        apply_transform("cast_text", [1, 2, 3])
+
+
+def test_cast_text_on_a_dict_raises():
+    with pytest.raises(TransformError, match="cannot cast a dict"):
+        apply_transform("cast_text", {"a": 1})
+
+
+def test_cast_int_and_float_on_a_list_still_raise_with_the_new_guard():
+    # int()/float() already raised before this fix — confirms the new
+    # upfront guard doesn't change that, just makes bool/text consistent.
+    with pytest.raises(TransformError, match="cannot cast a list"):
+        apply_transform("cast_int", [1, 2, 3])
+    with pytest.raises(TransformError, match="cannot cast a list"):
+        apply_transform("cast_float", [1, 2, 3])
+
+
 def test_unrecognized_transform_raises():
     with pytest.raises(TransformError):
         apply_transform("something_made_up", "x")

@@ -68,6 +68,23 @@ def apply_transform(transform: str | None, value: Any) -> Any:
 
 
 def _cast(pytype: type, value: Any, transform: str) -> Any:
+    # `int()`/`float()` already reject a list/dict loudly on their own —
+    # `bool()` and `str()` don't: `bool([1, 2, 3])` is `True` (any non-empty
+    # list is truthy — the exact same footgun class as the character-by-
+    # character scalar-iteration bug elsewhere in this tool, found the same
+    # way: testing directly rather than assuming), and `str([1, 2, 3])`
+    # silently lands the Python repr `'[1, 2, 3]'` in a text column. No
+    # transform in this DSL applies element-wise to an array — a Mongo
+    # array mapped with no transform at all already lands correctly on a
+    # Postgres ARRAY column (psycopg's COPY path adapts Python lists
+    # automatically) — so this guard covers all four cast_* transforms
+    # uniformly rather than relying on int()/float() happening to raise.
+    if isinstance(value, list | dict):
+        raise TransformError(
+            f"{transform}: cannot cast a {type(value).__name__} ({value!r}) — this transform expects a "
+            "scalar value. A Mongo array mapped with no transform at all already lands correctly on a "
+            "Postgres ARRAY column; no transform here applies element-wise to an array."
+        )
     try:
         return pytype(value)
     except (ValueError, TypeError) as e:
