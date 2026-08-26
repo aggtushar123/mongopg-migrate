@@ -29,6 +29,13 @@ each entity's own mapped fields and its jsonb payload, not `explode`/
 `junction` child rows — count diff already covers those at the row-count
 level; per-field sampling of child rows is a reasonable future extension,
 not done here.
+
+`mapping.external_databases` (a `lookup:` whose entity lives in a
+*different* Postgres database — see migrate/load.py's module docstring)
+is resolved the same way here as at load time: `open_external_connections()`
+opens one connection per distinct external database, and
+`_recompute_field_value` checks the right one instead of always assuming
+`postgres_dsn`'s own `_mongopg.id_map`.
 """
 
 from __future__ import annotations
@@ -47,6 +54,11 @@ from pymongo.database import Database
 from mongopg_migrate.introspect.postgres import PostgresSchema
 from mongopg_migrate.mapping.schema import EntityMapping, FieldSpec, MappingFile
 from mongopg_migrate.migrate import idmap
+from mongopg_migrate.migrate.load import (
+    LoadError,
+    close_external_connections,
+    open_external_connections,
+)
 from mongopg_migrate.migrate.transform import apply_default, apply_transform, get_nested, json_safe
 
 DEFAULT_SAMPLE_SIZE = 200
@@ -204,17 +216,28 @@ def _recompute_field_value(
     pg_schema: PostgresSchema,
     target_table: str,
     internal_schema: str,
+    external_conns: dict[str, psycopg.Connection] | None = None,
 ) -> Any:
     """Mirrors migrate/load.py's field resolution exactly (same transform,
-    same lookup-via-id_map), but read-only: a lookup miss here is reported
-    as a mismatch rather than raised, since by validation time the row is
-    already loaded — if id_map no longer has the entry, that is itself the
-    finding, not a reason to crash."""
+    same lookup-via-id_map, same external-database routing for a
+    `mapping.external_databases` entity), but read-only: a lookup miss here
+    is reported as a mismatch rather than raised, since by validation time
+    the row is already loaded — if id_map no longer has the entry, that is
+    itself the finding, not a reason to crash."""
     raw = get_nested(doc, key)
     if fspec.lookup:
         if raw is None:
             return None
-        target_id_str = idmap.get(conn, fspec.lookup, str(raw), schema=internal_schema)
+        # Same rule as migrate/load.py's _resolve_lookup: a cross-database
+        # external entity always uses its own database's real, default
+        # schema — never this run's own internal_schema.
+        if fspec.lookup in (external_conns or {}):
+            id_map_conn = external_conns[fspec.lookup]
+            id_map_schema = idmap.DEFAULT_SCHEMA_NAME
+        else:
+            id_map_conn = conn
+            id_map_schema = internal_schema
+        target_id_str = idmap.get(id_map_conn, fspec.lookup, str(raw), schema=id_map_schema)
         if target_id_str is None:
             return _LOOKUP_MISSING
         col_type = pg_schema.tables[target_table].columns[fspec.target].data_type.lower()
@@ -231,6 +254,7 @@ def _sample_diffs(
     *,
     sample_size: int,
     internal_schema: str,
+    external_conns: dict[str, psycopg.Connection] | None = None,
 ) -> tuple[list[SampleDiff], int]:
     diffs: list[SampleDiff] = []
     total_sampled = 0
@@ -267,6 +291,7 @@ def _sample_diffs(
                 _recompute_field_value(
                     doc, k, entity.fields[k], conn=conn, pg_schema=pg_schema,
                     target_table=entity.target, internal_schema=internal_schema,
+                    external_conns=external_conns,
                 )
                 for k in field_keys
             ]
@@ -331,6 +356,11 @@ def validate(
 ) -> ValidationReport:
     client: MongoClient = MongoClient(mongo_uri)
     try:
+        external_conns = open_external_connections(mapping)
+    except LoadError as e:
+        client.close()
+        raise ValidationError(str(e)) from e
+    try:
         db: Database = client.get_default_database()
         if db is None:
             raise ValidationError("MONGO_URI must include a default database")
@@ -347,8 +377,10 @@ def validate(
 
             count_diffs = _count_diffs(db, conn, mapping)
             sample_diffs, sampled_rows = _sample_diffs(
-                db, conn, mapping, pg_schema, sample_size=sample_size, internal_schema=internal_schema
+                db, conn, mapping, pg_schema, sample_size=sample_size, internal_schema=internal_schema,
+                external_conns=external_conns,
             )
         return ValidationReport(count_diffs=count_diffs, sample_diffs=sample_diffs, sampled_rows=sampled_rows)
     finally:
         client.close()
+        close_external_connections(external_conns)

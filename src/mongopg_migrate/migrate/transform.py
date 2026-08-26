@@ -1,6 +1,9 @@
 """The small transform DSL referenced by `FieldSpec.transform` (PRD §7:
 "Small transform DSL in the mapping file: cast, default, split,
-json_extract, enum mapping").
+json_extract, enum mapping") — all five now implemented (`enum:` and
+`split:` were the last two; both came out of a real cross-DB migration
+where an ORM's stored enum labels didn't match the target Postgres
+column's).
 
 `json_extract:<path>` is not handled here — `mapping/propose.py` already
 encodes the nested path directly into the field's dict key (e.g.
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import json
 from typing import Any
 
 
@@ -56,6 +60,10 @@ def apply_transform(transform: str | None, value: Any) -> Any:
         return _cast(str, value, transform)
     if transform == "cast_bool":
         return _cast(bool, value, transform)
+    if transform.startswith("enum:"):
+        return _apply_enum(transform, value)
+    if transform.startswith("split:"):
+        return _apply_split(transform, value)
     raise TransformError(f"unrecognized transform {transform!r} — see migrate/transform.py")
 
 
@@ -64,6 +72,54 @@ def _cast(pytype: type, value: Any, transform: str) -> Any:
         return pytype(value)
     except (ValueError, TypeError) as e:
         raise TransformError(f"{transform}: cannot cast {value!r} ({type(value).__name__}): {e}") from e
+
+
+def _apply_enum(transform: str, value: Any) -> Any:
+    """`enum:<json object>` remaps a raw value through an explicit lookup
+    table — e.g. `enum:{"1": "active", "2": "inactive"}` for a source
+    system's integer/short-code enum landing on a Postgres column with
+    different labels (the most common real gap: a Prisma/ORM enum whose
+    stored values don't match the target column's labels verbatim). A `"*"`
+    key is an explicit fallback for anything not otherwise listed; without
+    one, an unlisted value is a loud TransformError, not a silent
+    pass-through or a guessed label — same "never silently guess" rule as
+    everywhere else in this tool.
+    """
+    raw_mapping = transform[len("enum:") :]
+    try:
+        mapping = json.loads(raw_mapping)
+    except json.JSONDecodeError as e:
+        raise TransformError(f"enum: invalid JSON mapping {raw_mapping!r}: {e}") from e
+    if not isinstance(mapping, dict):
+        raise TransformError(f"enum: mapping must be a JSON object, got {type(mapping).__name__}: {raw_mapping!r}")
+    key = str(value)
+    if key in mapping:
+        return mapping[key]
+    if "*" in mapping:
+        return mapping["*"]
+    raise TransformError(
+        f"enum: value {value!r} has no entry in the mapping and no \"*\" fallback is set — "
+        "add one or the other"
+    )
+
+
+def _apply_split(transform: str, value: Any) -> list:
+    """`split:<delimiter>` turns a delimited string into a list — for a
+    source field like a comma-separated tag string landing on a Postgres
+    ARRAY column. Like every other transform here, this is one field -> one
+    column: it does NOT turn one source field into several Postgres columns
+    (e.g. splitting "fullName" into separate first_name/last_name columns)
+    — the mapping format has no way to express one source field feeding two
+    `FieldSpec`s (same limitation `mapping/llm_propose.py` documents from
+    the LLM-assist side, where a "split" suggestion is surfaced, not
+    applied, for exactly this reason).
+    """
+    delimiter = transform[len("split:") :]
+    if not delimiter:
+        raise TransformError("split: needs a non-empty delimiter, e.g. `split:,`")
+    if not isinstance(value, str):
+        raise TransformError(f"split: expected a string, got {value!r} ({type(value).__name__})")
+    return value.split(delimiter)
 
 
 def apply_default(transform: str | None, value: Any) -> Any:

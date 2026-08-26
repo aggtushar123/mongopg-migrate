@@ -71,3 +71,52 @@ def test_apply_default_only_kicks_in_on_none():
     assert apply_default("default:0", "present") == "present"
     assert apply_default(None, None) is None
     assert apply_default("cast_int", None) is None
+
+
+# --- enum: ---------------------------------------------------------------------------
+
+
+def test_enum_maps_known_value():
+    assert apply_transform('enum:{"1": "active", "2": "inactive"}', "1") == "active"
+    assert apply_transform('enum:{"1": "active", "2": "inactive"}', 2) == "inactive"  # int key stringified
+
+
+def test_enum_falls_back_to_wildcard():
+    result = apply_transform('enum:{"1": "active", "*": "unknown"}', "99")
+    assert result == "unknown"
+
+
+def test_enum_raises_on_unlisted_value_with_no_wildcard():
+    with pytest.raises(TransformError, match="no entry in the mapping"):
+        apply_transform('enum:{"1": "active"}', "99")
+
+
+def test_enum_raises_on_invalid_json():
+    with pytest.raises(TransformError, match="invalid JSON"):
+        apply_transform("enum:{not valid json", "1")
+
+
+def test_enum_raises_when_mapping_is_not_an_object():
+    with pytest.raises(TransformError, match="must be a JSON object"):
+        apply_transform("enum:[1, 2, 3]", "1")
+
+
+# --- split: ----------------------------------------------------------------------------
+
+
+def test_split_turns_delimited_string_into_a_list():
+    assert apply_transform("split:,", "red,blue,green") == ["red", "blue", "green"]
+
+
+def test_split_supports_multi_character_delimiter():
+    assert apply_transform("split:, ", "red, blue, green") == ["red", "blue", "green"]
+
+
+def test_split_raises_on_empty_delimiter():
+    with pytest.raises(TransformError, match="non-empty delimiter"):
+        apply_transform("split:", "a,b")
+
+
+def test_split_raises_on_non_string_input():
+    with pytest.raises(TransformError, match="expected a string"):
+        apply_transform("split:,", 42)

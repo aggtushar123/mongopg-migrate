@@ -54,11 +54,21 @@ would only ever see whatever existed the first time an entity finished,
 and picking up documents inserted since would require manually deleting
 the checkpoint row. `already_done=True` on the result now means "queried,
 found nothing new" rather than "didn't even look".
+
+`mapping.external_databases` (a microservices-split scenario: e.g. a
+`bookings` mapping targeting a booking-service database needs `lookup:
+hospitals`, where `hospitals` was migrated into a *separate*
+hospital-service database) opens one extra read/write connection per
+distinct external database — see `open_external_connections()` — and
+routes `lookup:` resolution for those specific entities to that
+connection's `_mongopg.id_map` instead of this run's own. Every other
+entity's lookups, and everything else about the load, are unaffected.
 """
 
 from __future__ import annotations
 
 import itertools
+import os
 import uuid
 from dataclasses import dataclass, field
 
@@ -116,14 +126,29 @@ def _resolve_lookup(
     pg_schema: PostgresSchema,
     *,
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
+    external_conns: dict[str, psycopg.Connection] | None = None,
 ):
     if source_value is None:
         return None
     source_id_str = str(source_value)
-    target_id_str = idmap.get(conn, lookup_entity, source_id_str, schema=internal_schema)
+    # A cross-database external entity (mapping.external_databases) is checked
+    # on its own connection, in its own database's id_map — under that
+    # database's real, default `_mongopg` schema, NEVER this run's own
+    # `internal_schema`. `internal_schema` only means something for *this*
+    # run's own local bookkeeping (Layer B's disposable pass renames it to a
+    # throwaway schema) — the external database is a separate, independently
+    # migrated database whose id_map always lives at the standard name,
+    # regardless of what this particular run happens to call its own.
+    if lookup_entity in (external_conns or {}):
+        lookup_conn = external_conns[lookup_entity]
+        lookup_schema = idmap.DEFAULT_SCHEMA_NAME
+    else:
+        lookup_conn = conn
+        lookup_schema = internal_schema
+    target_id_str = idmap.get(lookup_conn, lookup_entity, source_id_str, schema=lookup_schema)
     if target_id_str is None:
         raise LoadError(
-            f"lookup miss: no {internal_schema}.id_map row for entity={lookup_entity!r} "
+            f"lookup miss: no {lookup_schema}.id_map row for entity={lookup_entity!r} "
             f"source_id={source_id_str!r} (needed for {target_table}.{target_column}) — "
             f"was {lookup_entity!r} loaded first? See MappingFile.entity_load_order()."
         )
@@ -140,11 +165,19 @@ def _resolve_field_value(
     pg_schema: PostgresSchema,
     target_table: str,
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
+    external_conns: dict[str, psycopg.Connection] | None = None,
 ):
     raw = get_nested(doc, key)
     if fspec.lookup:
         value = _resolve_lookup(
-            conn, fspec.lookup, raw, target_table, fspec.target, pg_schema, internal_schema=internal_schema
+            conn,
+            fspec.lookup,
+            raw,
+            target_table,
+            fspec.target,
+            pg_schema,
+            internal_schema=internal_schema,
+            external_conns=external_conns,
         )
     else:
         value = apply_transform(fspec.transform, raw)
@@ -208,6 +241,45 @@ def _upsert_rows(
         )
 
 
+def open_external_connections(mapping: MappingFile) -> dict[str, psycopg.Connection]:
+    """One connection per distinct database named in `mapping.external_databases`
+    (deduplicated by DSN — two external entities pointing at the same env var
+    share one connection), keyed by entity name for `_resolve_lookup`'s lookup.
+    Raises LoadError (closing whatever it already opened first) if a named
+    env var isn't set — fail before any Mongo read or Postgres write, not
+    partway through a batch.
+    """
+    dsn_conns: dict[str, psycopg.Connection] = {}
+    entity_conns: dict[str, psycopg.Connection] = {}
+    try:
+        for entity_name, env_var in mapping.external_databases.items():
+            dsn = os.environ.get(env_var)
+            if not dsn:
+                raise LoadError(
+                    f"external_databases: entity {entity_name!r} names env var {env_var!r}, "
+                    "which is not set"
+                )
+            if dsn not in dsn_conns:
+                dsn_conns[dsn] = psycopg.connect(dsn)
+            entity_conns[entity_name] = dsn_conns[dsn]
+    except Exception:
+        close_external_connections(dsn_conns)
+        raise
+    return entity_conns
+
+
+def close_external_connections(conns: dict[str, psycopg.Connection]) -> None:
+    """Accepts either the entity-keyed dict `open_external_connections()`
+    returns or the dsn-keyed one it builds internally — only `.values()`
+    matters, deduplicated by identity so a connection shared by two entities
+    isn't closed twice."""
+    seen: set[int] = set()
+    for conn in conns.values():
+        if id(conn) not in seen:
+            seen.add(id(conn))
+            conn.close()
+
+
 def _mapped_tables(mapping: MappingFile) -> set[str]:
     tables: set[str] = set()
     for entity in mapping.entities.values():
@@ -244,6 +316,7 @@ def _load_entity_batches(
     *,
     mode: str = "append",
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
+    external_conns: dict[str, psycopg.Connection] | None = None,
 ) -> EntityLoadResult:
     # Local import: keeps bson out of modules that don't need Mongo types.
     from bson.errors import InvalidId
@@ -328,6 +401,7 @@ def _load_entity_batches(
                         pg_schema=pg_schema,
                         target_table=table,
                         internal_schema=internal_schema,
+                        external_conns=external_conns,
                     )
                 )
             if jsonb_fields:
@@ -348,6 +422,7 @@ def _load_entity_batches(
                                 pg_schema=pg_schema,
                                 target_table=exp.target,
                                 internal_schema=internal_schema,
+                                external_conns=external_conns,
                             )
                         )
                     explode_rows[ename].append(tuple(erow))
@@ -363,6 +438,7 @@ def _load_entity_batches(
                             junc.child_fk.target_field,
                             pg_schema,
                             internal_schema=internal_schema,
+                            external_conns=external_conns,
                         )
                     else:
                         child_val = child_source
@@ -435,6 +511,7 @@ def load(
     order = mapping.entity_load_order()  # raises CircularEntityDependencyError
 
     mongo_client: MongoClient = MongoClient(mongo_uri)
+    external_conns = open_external_connections(mapping)
     try:
         db: Database = mongo_client.get_default_database()
         if db is None:
@@ -467,8 +544,10 @@ def load(
                     batch_size,
                     mode=mode,
                     internal_schema=internal_schema,
+                    external_conns=external_conns,
                 )
                 summary.results.append(result)
             return summary
     finally:
         mongo_client.close()
+        close_external_connections(external_conns)

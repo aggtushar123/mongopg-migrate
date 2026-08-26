@@ -55,7 +55,11 @@ from mongopg_migrate.mapping.schema import (
     MappingFile,
 )
 from mongopg_migrate.migrate import idmap
-from mongopg_migrate.migrate.load import LoadError
+from mongopg_migrate.migrate.load import (
+    LoadError,
+    close_external_connections,
+    open_external_connections,
+)
 from mongopg_migrate.migrate.load import load as run_batch_load
 from mongopg_migrate.migrate.transform import (
     TransformError,
@@ -139,6 +143,7 @@ def _check_existence(
     *,
     conn: psycopg.Connection | None = None,
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
+    external_conns: dict[str, psycopg.Connection] | None = None,
 ) -> dict[str, set[str]]:
     """One batched `$in` existence query per referenced entity, against
     Mongo directly (see module docstring for why not against id_map, in
@@ -147,7 +152,9 @@ def _check_existence(
     migrated in an earlier run, this mapping only covers `orders`) — there
     is no local Mongo-side collection mapping to check against locally in
     the way a declared entity has, so those are checked against the real
-    `_mongopg.id_map` instead, when a connection is available. Without one,
+    `_mongopg.id_map` instead: on `external_conns[lookup_entity]` when the
+    entity lives in a *different* database (`mapping.external_databases`),
+    else on this run's own `conn`. Without any connection available,
     external lookups are left unverified here — dry-run's Layer A doesn't
     hard-require Postgres access, so this degrades gracefully rather than
     failing; `validate_structure` already ensures every non-external
@@ -162,12 +169,26 @@ def _check_existence(
             coll = db[target_entity.source]
             docs = coll.find({"_id": {"$in": list(raw_values)}}, {"_id": 1})
             found[lookup_entity] = {str(d["_id"]) for d in docs}
-        elif lookup_entity in mapping.external_entities and conn is not None:
-            found[lookup_entity] = {
-                str(raw)
-                for raw in raw_values
-                if idmap.get(conn, lookup_entity, str(raw), schema=internal_schema) is not None
-            }
+            continue
+        if lookup_entity not in mapping.external_entities:
+            continue
+        # Same rule as migrate/load.py's _resolve_lookup: a cross-database
+        # external entity always uses its own database's real, default
+        # schema — never this run's own (possibly Layer-B-disposable)
+        # internal_schema.
+        if lookup_entity in (external_conns or {}):
+            id_map_conn = external_conns[lookup_entity]
+            id_map_schema = idmap.DEFAULT_SCHEMA_NAME
+        else:
+            id_map_conn = conn
+            id_map_schema = internal_schema
+        if id_map_conn is None:
+            continue
+        found[lookup_entity] = {
+            str(raw)
+            for raw in raw_values
+            if idmap.get(id_map_conn, lookup_entity, str(raw), schema=id_map_schema) is not None
+        }
     return found
 
 
@@ -270,14 +291,19 @@ def run_fast_pass(
 ) -> DryRunReport:
     """`postgres_dsn` is optional and read-only when given: it's only used
     to check `_mongopg.id_map` for `lookup:`s that name an `external_entities`
-    entry (see `_check_existence`). Without it, external lookups simply
-    aren't checked — everything else about Layer A is unaffected."""
+    entry (see `_check_existence`) that lives in *this* database. An entity
+    listed in `mapping.external_databases` (a different database entirely —
+    the microservices-split case) is checked on its own connection
+    regardless of whether `postgres_dsn` is given. Without `postgres_dsn`,
+    same-database external lookups simply aren't checked — everything else
+    about Layer A is unaffected."""
     order = mapping.entity_load_order()  # also surfaces CircularEntityDependencyError early
 
     client: MongoClient = MongoClient(mongo_uri)
     violations: list[DryRunViolation] = []
     truncated = False
     pg_conn = psycopg.connect(postgres_dsn) if postgres_dsn else None
+    external_conns = open_external_connections(mapping)
     try:
         db: Database = client.get_default_database()
         if db is None:
@@ -298,7 +324,7 @@ def run_fast_pass(
                     break
 
                 needs = _collect_batch_lookup_needs(batch, entity)
-                found = _check_existence(db, mapping, needs, conn=pg_conn)
+                found = _check_existence(db, mapping, needs, conn=pg_conn, external_conns=external_conns)
 
                 for doc in batch:
                     violations.extend(_validate_id_strategy(doc, entity, entity_name))
@@ -343,6 +369,7 @@ def run_fast_pass(
         client.close()
         if pg_conn is not None:
             pg_conn.close()
+        close_external_connections(external_conns)
 
     return DryRunReport(violations=violations, truncated=truncated)
 

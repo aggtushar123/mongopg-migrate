@@ -263,6 +263,30 @@ class MappingFile(BaseModel):
     # genuine typo in `lookup:` a hard error instead of a false "it's
     # external" pass.
     external_entities: list[str] = Field(default_factory=list)
+    # Subset of `external_entities` whose id_map rows live in a *different*
+    # Postgres database than this run's own --postgres-uri — the
+    # microservices-split case: e.g. `bookings` targets the booking-service
+    # database but needs `lookup: hospitals`, and `hospitals` was migrated
+    # into a separate hospital-service database. Maps entity name -> the
+    # NAME of an environment variable holding that database's connection
+    # string (never the connection string itself — this is a mapping file,
+    # typically checked into version control; a raw credential doesn't
+    # belong in it, same reasoning as --llm-api-key-env). Resolved at
+    # migrate/dry-run/validate time by migrate/load.py's
+    # open_external_connections(). Entities not listed here but present in
+    # `external_entities` are assumed to live in the *same* database as
+    # this run and are checked against this run's own id_map, as before.
+    external_databases: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _external_databases_subset_of_external_entities(self) -> MappingFile:
+        unknown = set(self.external_databases) - set(self.external_entities)
+        if unknown:
+            raise ValueError(
+                f"external_databases names entities not listed in external_entities: {sorted(unknown)} "
+                "— add them there too"
+            )
+        return self
 
     def entity_dependencies(self) -> dict[str, set[str]]:
         """entity name -> set of entity names it `lookup:`s against, at any
