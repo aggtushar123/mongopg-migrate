@@ -88,6 +88,7 @@ from mongopg_migrate.mapping.schema import (
     ExplodeSpec,
     FieldSpec,
     MappingFile,
+    OnMissing,
     UnpivotItem,
 )
 from mongopg_migrate.migrate import checkpoint, idmap
@@ -102,12 +103,48 @@ class LoadError(Exception):
     pass
 
 
+class SkipRowError(Exception):
+    """Internal control-flow signal only — never escapes _load_entity_batches.
+    Raised by _resolve_lookup when a dangling reference's on_missing policy
+    is `skip_row`; caught at the granularity that policy actually means:
+    the whole document for a top-level entity field, one array item for an
+    explode field, one junction row for a junction child_fk."""
+
+
+@dataclass
+class OnMissingStats:
+    """Per-entity-load accumulator for `on_missing` outcomes — persists
+    across every batch of one entity's load, same reasoning as `id_buffer`.
+    Keyed by a human-readable field path (e.g. "kyc_steps.mcmUserId") so a
+    mapping with several on_missing-enabled fields gets a breakdown, not
+    just one opaque total. This is the mechanism behind the requirement
+    that a rescued dangling reference is always counted and reported —
+    never a silent null-ing (that would be the exact bug class this tool
+    exists to prevent: counts match, data is quietly wrong)."""
+
+    nulled: dict[str, int] = field(default_factory=dict)
+    skipped: dict[str, int] = field(default_factory=dict)
+
+    def record_null(self, key: str) -> None:
+        self.nulled[key] = self.nulled.get(key, 0) + 1
+
+    def record_skip(self, key: str) -> None:
+        self.skipped[key] = self.skipped.get(key, 0) + 1
+
+    @property
+    def total_skipped(self) -> int:
+        return sum(self.skipped.values())
+
+
 @dataclass
 class EntityLoadResult:
     entity: str
     rows_loaded: int
     resumed_from: str | None
     already_done: bool = False
+    rows_skipped: int = 0  # documents dropped entirely by an on_missing=skip_row at the entity-field level
+    nulled_lookups: dict[str, int] = field(default_factory=dict)  # field path -> count rescued to NULL
+    skipped_lookups: dict[str, int] = field(default_factory=dict)  # field path -> count that caused a skip (row/item/junction-row)
 
 
 @dataclass
@@ -184,6 +221,7 @@ def _collect_explode_rows(
     explode_rows: dict[str, list[tuple]],
     internal_schema: str,
     external_conns: dict[str, psycopg.Connection] | None,
+    stats: OnMissingStats | None = None,
 ) -> None:
     """Builds this level's rows for one parent document's array, recursing
     into any nested `explode` children. Only a level WITH nested children
@@ -191,6 +229,12 @@ def _collect_explode_rows(
     on such a level, so `resolve_new_id` is always usable here); a leaf
     level keeps relying on Postgres's own SERIAL default, exactly as before
     nesting existed — `own_id_value` stays None and is simply not written.
+
+    A field's `on_missing: skip_row` here drops just that one array item
+    (`SkipRowError` caught per-item, below) — not the parent document and
+    not sibling items. That's a deliberately different granularity than
+    the same policy on a top-level entity field, where "the row this
+    field's value belongs to" is the whole document.
     """
     has_children = bool(exp.explode)
     id_col_default = None
@@ -201,34 +245,38 @@ def _collect_explode_rows(
             id_col_default = table_schema.columns[id_col].default
 
     for item in items:
-        row: list = [parent_value]
-        own_id_value = None
-        if has_children:
-            source_field = exp.id_strategy.source_field or "_id"
-            source_val = get_nested(item, source_field)
-            resolved = resolve_new_id(
-                exp.id_strategy,
-                source_val,
-                conn=conn,
-                column_default=id_col_default,
-                id_buffer=id_buffers.setdefault(path, {}),
-            )
-            own_id_value = resolved.column_value
-            row.append(own_id_value)
-        for k, fspec in exp.fields.items():
-            row.append(
-                _resolve_field_value(
-                    item,
-                    k,
-                    fspec,
-                    context=f"{context}.{path}",
+        try:
+            row: list = [parent_value]
+            own_id_value = None
+            if has_children:
+                source_field = exp.id_strategy.source_field or "_id"
+                source_val = get_nested(item, source_field)
+                resolved = resolve_new_id(
+                    exp.id_strategy,
+                    source_val,
                     conn=conn,
-                    pg_schema=pg_schema,
-                    target_table=exp.target,
-                    internal_schema=internal_schema,
-                    external_conns=external_conns,
+                    column_default=id_col_default,
+                    id_buffer=id_buffers.setdefault(path, {}),
                 )
-            )
+                own_id_value = resolved.column_value
+                row.append(own_id_value)
+            for k, fspec in exp.fields.items():
+                row.append(
+                    _resolve_field_value(
+                        item,
+                        k,
+                        fspec,
+                        context=f"{context}.{path}",
+                        conn=conn,
+                        pg_schema=pg_schema,
+                        target_table=exp.target,
+                        internal_schema=internal_schema,
+                        external_conns=external_conns,
+                        stats=stats,
+                    )
+                )
+        except SkipRowError:
+            continue
         explode_rows[path].append(tuple(row))
 
         for nested_ename, nested_exp in exp.explode.items():
@@ -244,6 +292,7 @@ def _collect_explode_rows(
                 pg_schema=pg_schema,
                 id_buffers=id_buffers,
                 explode_rows=explode_rows,
+                stats=stats,
                 internal_schema=internal_schema,
                 external_conns=external_conns,
             )
@@ -259,6 +308,9 @@ def _resolve_lookup(
     *,
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
     external_conns: dict[str, psycopg.Connection] | None = None,
+    on_missing: OnMissing = OnMissing.ERROR,
+    stats: OnMissingStats | None = None,
+    stats_key: str | None = None,
 ):
     if source_value is None:
         return None
@@ -279,10 +331,25 @@ def _resolve_lookup(
         lookup_schema = internal_schema
     target_id_str = idmap.get(lookup_conn, lookup_entity, source_id_str, schema=lookup_schema)
     if target_id_str is None:
+        # A *dangling* reference — source_value is present, but nothing in
+        # id_map resolves it (e.g. the referenced document was deleted).
+        # Distinct from source_value being absent/null in the first place,
+        # which returned None above and was never this tool's problem.
+        key = stats_key or f"{lookup_entity}<-{target_table}.{target_column}"
+        if on_missing == OnMissing.NULL:
+            if stats is not None:
+                stats.record_null(key)
+            return None
+        if on_missing == OnMissing.SKIP_ROW:
+            if stats is not None:
+                stats.record_skip(key)
+            raise SkipRowError(key)
         raise LoadError(
             f"lookup miss: no {lookup_schema}.id_map row for entity={lookup_entity!r} "
             f"source_id={source_id_str!r} (needed for {target_table}.{target_column}) — "
-            f"was {lookup_entity!r} loaded first? See MappingFile.entity_load_order()."
+            f"was {lookup_entity!r} loaded first? See MappingFile.entity_load_order(). "
+            "If this is a known, acceptable data-quality gap (e.g. a deleted referenced "
+            "document), set `on_missing: null` or `on_missing: skip_row` on this field/junction."
         )
     return _cast_for_column(target_id_str, _column_type(pg_schema, target_table, target_column))
 
@@ -298,6 +365,7 @@ def _resolve_field_value(
     target_table: str,
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
     external_conns: dict[str, psycopg.Connection] | None = None,
+    stats: OnMissingStats | None = None,
 ):
     raw = get_nested(doc, key)
     if fspec.lookup:
@@ -310,6 +378,9 @@ def _resolve_field_value(
             pg_schema,
             internal_schema=internal_schema,
             external_conns=external_conns,
+            on_missing=fspec.on_missing,
+            stats=stats,
+            stats_key=f"{context}.{key}",
         )
     else:
         value = apply_transform(fspec.transform, raw)
@@ -319,9 +390,14 @@ def _resolve_field_value(
         col = pg_schema.tables.get(target_table, None)
         col_info = col.columns.get(fspec.target) if col else None
         if col_info is not None and not col_info.is_nullable:
+            reason = (
+                "on_missing=null rescued a dangling lookup, but"
+                if fspec.lookup and fspec.on_missing == OnMissing.NULL
+                else "source field missing/null and"
+            )
             raise LoadError(
                 f"{context}.{key}: null value for NOT NULL column {target_table}.{fspec.target} "
-                "(source field missing/null and no `default:` transform set)"
+                f"({reason} no `default:` transform set)"
             )
     return value
 
@@ -482,6 +558,10 @@ def _load_entity_batches(
     # batch) — an int_sequence id_strategy reserves a block of ids per
     # generate_series() round trip instead of one nextval() per document.
     id_buffer: dict[str, list[int]] = {}
+    # Persists across every batch too — the running tally behind
+    # EntityLoadResult.rows_skipped/nulled_lookups/skipped_lookups.
+    stats = OnMissingStats()
+    rows_skipped = 0
 
     table = entity.target
     id_col = entity.id_strategy.target_field
@@ -562,69 +642,106 @@ def _load_entity_batches(
                 entity.id_strategy, source_id, conn=conn, column_default=id_col_default, id_buffer=id_buffer
             )
 
-            row = [resolved.column_value]
-            for k in field_keys:
-                row.append(
-                    _resolve_field_value(
-                        doc,
-                        k,
-                        entity.fields[k],
+            # Everything for this one document is built into LOCAL
+            # containers first, and only merged into the batch-level
+            # accumulators (main_rows, explode_rows, ...) at the very end,
+            # once we know the document isn't being dropped. An
+            # on_missing=skip_row miss can surface partway through (say,
+            # the 3rd of 5 fields) — by then main_rows may already have
+            # been appended to under the old structure, which would leave
+            # a half-built row with no way to take it back. Building
+            # locally and merging only on success avoids that entirely.
+            try:
+                row = [resolved.column_value]
+                for k in field_keys:
+                    row.append(
+                        _resolve_field_value(
+                            doc,
+                            k,
+                            entity.fields[k],
+                            context=entity_name,
+                            conn=conn,
+                            pg_schema=pg_schema,
+                            target_table=table,
+                            internal_schema=internal_schema,
+                            external_conns=external_conns,
+                            stats=stats,
+                        )
+                    )
+                if jsonb_fields:
+                    row.append(_build_jsonb_payload(doc, jsonb_fields))
+                doc_main_row = tuple(row)
+
+                doc_explode_rows: dict[str, list[tuple]] = {k: [] for k in explode_columns}
+                for ename, exp in entity.explode.items():
+                    items = _require_array(doc, ename, context=entity_name)
+                    _collect_explode_rows(
+                        resolved.column_value,
+                        items,
+                        exp,
+                        path=ename,
                         context=entity_name,
                         conn=conn,
                         pg_schema=pg_schema,
-                        target_table=table,
+                        id_buffers=explode_id_buffers,
+                        explode_rows=doc_explode_rows,
                         internal_schema=internal_schema,
                         external_conns=external_conns,
+                        stats=stats,
                     )
-                )
-            if jsonb_fields:
-                row.append(_build_jsonb_payload(doc, jsonb_fields))
-            main_rows.append(tuple(row))
 
-            for ename, exp in entity.explode.items():
-                items = _require_array(doc, ename, context=entity_name)
-                _collect_explode_rows(
-                    resolved.column_value,
-                    items,
-                    exp,
-                    path=ename,
-                    context=entity_name,
-                    conn=conn,
-                    pg_schema=pg_schema,
-                    id_buffers=explode_id_buffers,
-                    explode_rows=explode_rows,
-                    internal_schema=internal_schema,
-                    external_conns=external_conns,
-                )
+                doc_junction_rows: dict[str, list[tuple]] = {k: [] for k in junction_columns}
+                for jname, junc in entity.junction.items():
+                    for child_source in _require_array(doc, jname, context=entity_name):
+                        if junc.child_fk.lookup:
+                            # A dangling child_fk can only ever be skip_row (never null —
+                            # see JunctionSpec.on_missing's docstring: the child_fk *is*
+                            # half the row's identity). The skip is scoped to just this one
+                            # junction row, caught right here — never let it escape and
+                            # skip the whole parent document.
+                            try:
+                                child_val = _resolve_lookup(
+                                    conn,
+                                    junc.child_fk.lookup,
+                                    child_source,
+                                    junc.target,
+                                    junc.child_fk.target_field,
+                                    pg_schema,
+                                    internal_schema=internal_schema,
+                                    external_conns=external_conns,
+                                    on_missing=junc.on_missing,
+                                    stats=stats,
+                                    stats_key=f"{entity_name}.{jname}",
+                                )
+                            except SkipRowError:
+                                continue
+                        else:
+                            child_val = child_source
+                        doc_junction_rows[jname].append((resolved.column_value, child_val))
 
-            for jname, junc in entity.junction.items():
-                for child_source in _require_array(doc, jname, context=entity_name):
-                    if junc.child_fk.lookup:
-                        child_val = _resolve_lookup(
-                            conn,
-                            junc.child_fk.lookup,
-                            child_source,
-                            junc.target,
-                            junc.child_fk.target_field,
-                            pg_schema,
-                            internal_schema=internal_schema,
-                            external_conns=external_conns,
+                doc_unpivot_rows: dict[str, list[tuple]] = {k: [] for k in unpivot_columns}
+                for uname, unp in entity.unpivot.items():
+                    for item in unp.items:
+                        raw = get_nested(doc, item.source_field)
+                        if raw is None and unp.skip_null:
+                            continue
+                        value = _resolve_unpivot_value(
+                            doc, item, context=f"{entity_name}.{uname}", pg_schema=pg_schema,
+                            target_table=unp.target, value_column=unp.value_column,
                         )
-                    else:
-                        child_val = child_source
-                    junction_rows[jname].append((resolved.column_value, child_val))
+                        doc_unpivot_rows[uname].append((resolved.column_value, item.code, value))
+            except SkipRowError:
+                rows_skipped += 1
+                last_id_in_batch = source_id  # still advance past it — resume must not retry it forever
+                continue
 
-            for uname, unp in entity.unpivot.items():
-                for item in unp.items:
-                    raw = get_nested(doc, item.source_field)
-                    if raw is None and unp.skip_null:
-                        continue
-                    value = _resolve_unpivot_value(
-                        doc, item, context=f"{entity_name}.{uname}", pg_schema=pg_schema,
-                        target_table=unp.target, value_column=unp.value_column,
-                    )
-                    unpivot_rows[uname].append((resolved.column_value, item.code, value))
-
+            main_rows.append(doc_main_row)
+            for k, rows in doc_explode_rows.items():
+                explode_rows[k].extend(rows)
+            for k, rows in doc_junction_rows.items():
+                junction_rows[k].extend(rows)
+            for k, rows in doc_unpivot_rows.items():
+                unpivot_rows[k].extend(rows)
             idmap_entries.append((entity_name, str(source_id), resolved.str_form))
             last_id_in_batch = source_id
 
@@ -669,10 +786,14 @@ def _load_entity_batches(
 
         for e, s, t in idmap_entries:
             idmap.put(conn, e, s, t, schema=internal_schema)
-        checkpoint.advance(conn, entity_name, str(last_id_in_batch), len(batch), schema=internal_schema)
+        # rows_delta is main_rows, not len(batch): a batch containing
+        # skip_row-dropped documents loaded fewer main-table rows than
+        # documents it saw — the checkpoint's rows_loaded counter should
+        # reflect what was actually written, not what was looked at.
+        checkpoint.advance(conn, entity_name, str(last_id_in_batch), len(main_rows), schema=internal_schema)
         conn.commit()
 
-        total_rows += len(batch)
+        total_rows += len(main_rows)
 
     checkpoint.mark_done(conn, entity_name, schema=internal_schema)
     conn.commit()
@@ -680,7 +801,10 @@ def _load_entity_batches(
         entity=entity_name,
         rows_loaded=total_rows,
         resumed_from=resume_from,
-        already_done=(was_previously_done and total_rows == 0),
+        already_done=(was_previously_done and total_rows == 0 and rows_skipped == 0),
+        rows_skipped=rows_skipped,
+        nulled_lookups=stats.nulled,
+        skipped_lookups=stats.skipped,
     )
 
 

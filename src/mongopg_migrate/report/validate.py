@@ -57,6 +57,7 @@ from mongopg_migrate.mapping.schema import (
     ExplodeSpec,
     FieldSpec,
     MappingFile,
+    OnMissing,
     UnpivotSpec,
 )
 from mongopg_migrate.migrate import idmap
@@ -76,10 +77,16 @@ class CountDiff:
     table: str
     mongo_count: int
     postgres_count: int
+    # Known, already-reconciled reduction from an on_missing=skip_row policy
+    # (0 for anything else — a null policy still writes a row, so it never
+    # affects a count). Without this, a deliberate, explicitly-configured
+    # drop would report as an unexplained MISMATCH indistinguishable from
+    # real data loss — the exact confusion `on_missing` exists to avoid.
+    expected_skip: int = 0
 
     @property
     def matches(self) -> bool:
-        return self.mongo_count == self.postgres_count
+        return self.postgres_count == self.mongo_count - self.expected_skip
 
 
 @dataclass
@@ -90,10 +97,28 @@ class SampleDiff:
 
 
 @dataclass
+class OnMissingDiff:
+    """Independently re-derived, right now, from live Mongo + id_map — not
+    a copy of load.py's own in-memory tally (which is per-run and gone once
+    the process exits). Purely informational: a nonzero dangling_count is
+    the policy working as configured, not a failure — it never affects
+    ValidationReport.ok. Exists so 'every miss is counted and reported' is
+    true at validate time too, not just in migrate's own output, and so it
+    catches drift between migrate-time and validate-time (e.g. the
+    referenced entity was deleted after a successful migration)."""
+
+    entity: str
+    field: str
+    policy: str  # "null" | "skip_row"
+    dangling_count: int
+
+
+@dataclass
 class ValidationReport:
     count_diffs: list[CountDiff] = field(default_factory=list)
     sample_diffs: list[SampleDiff] = field(default_factory=list)
     sampled_rows: int = 0
+    on_missing_diffs: list[OnMissingDiff] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -171,7 +196,48 @@ def _sum_unpivot_rows(db: Database, collection: str, unp: UnpivotSpec, mongo_fil
     return total
 
 
-def _count_diffs(db: Database, conn: psycopg.Connection, mapping: MappingFile) -> list[CountDiff]:
+def _skip_row_reduction(
+    db: Database,
+    conn: psycopg.Connection,
+    entity: EntityMapping,
+    fields: dict,
+    *,
+    explode_path: str | None,
+    mongo_filter: dict,
+    internal_schema: str,
+    external_conns: dict[str, psycopg.Connection] | None,
+) -> int:
+    """Sum of dangling-reference counts across every on_missing=skip_row
+    field in `fields` (an entity's own `.fields`, or one explode level's
+    `.fields`). Known limitation, stated rather than hidden: if a single
+    row has more than one independently-dangling skip_row field, each is
+    counted here but the row is only ever actually dropped once — this can
+    over-subtract in that (rare — most mappings have at most one lookup
+    field prone to going dangling) case. A junction's skip_row reduction
+    doesn't share this risk (one child_fk per row) and isn't computed
+    here — see the junction branch in _count_diffs."""
+    total = 0
+    for key, fspec in fields.items():
+        if not fspec.lookup or fspec.on_missing != OnMissing.SKIP_ROW:
+            continue
+        if fspec.lookup in (external_conns or {}):
+            id_map_conn, id_map_schema = external_conns[fspec.lookup], idmap.DEFAULT_SCHEMA_NAME
+        else:
+            id_map_conn, id_map_schema = conn, internal_schema
+        known = _known_source_ids(id_map_conn, fspec.lookup, schema=id_map_schema)
+        present = _mongo_present_scalar_values(db, entity.source, explode_path, key, mongo_filter)
+        total += len(present - known)
+    return total
+
+
+def _count_diffs(
+    db: Database,
+    conn: psycopg.Connection,
+    mapping: MappingFile,
+    *,
+    internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
+    external_conns: dict[str, psycopg.Connection] | None = None,
+) -> list[CountDiff]:
     diffs: list[CountDiff] = []
     for name, entity in mapping.entities.items():
         # entity.mongo_filter() matters here specifically: without it, a
@@ -180,30 +246,50 @@ def _count_diffs(db: Database, conn: psycopg.Connection, mapping: MappingFile) -
         # count_documents({}) that looks fine but is comparing the wrong
         # numbers.
         mongo_filter = entity.mongo_filter()
+        entity_skip = _skip_row_reduction(
+            db, conn, entity, entity.fields, explode_path=None, mongo_filter=mongo_filter,
+            internal_schema=internal_schema, external_conns=external_conns,
+        )
         diffs.append(
             CountDiff(
                 entity=name,
                 table=entity.target,
                 mongo_count=db[entity.source].count_documents(mongo_filter),
                 postgres_count=_table_count(conn, entity.target),
+                expected_skip=entity_skip,
             )
         )
         for path, exp in _flatten_explode(entity.explode):
+            explode_skip = _skip_row_reduction(
+                db, conn, entity, exp.fields, explode_path=path, mongo_filter=mongo_filter,
+                internal_schema=internal_schema, external_conns=external_conns,
+            )
             diffs.append(
                 CountDiff(
                     entity=f"{name}.{path}",
                     table=exp.target,
                     mongo_count=_sum_nested_array_length(db, entity.source, path, mongo_filter),
                     postgres_count=_table_count(conn, exp.target),
+                    expected_skip=explode_skip,
                 )
             )
         for jname, junc in entity.junction.items():
+            junction_skip = 0
+            if junc.child_fk.lookup and junc.on_missing == OnMissing.SKIP_ROW:
+                if junc.child_fk.lookup in (external_conns or {}):
+                    id_map_conn, id_map_schema = external_conns[junc.child_fk.lookup], idmap.DEFAULT_SCHEMA_NAME
+                else:
+                    id_map_conn, id_map_schema = conn, internal_schema
+                known = _known_source_ids(id_map_conn, junc.child_fk.lookup, schema=id_map_schema)
+                present = _mongo_present_array_values(db, entity.source, jname, mongo_filter)
+                junction_skip = len(present - known)
             diffs.append(
                 CountDiff(
                     entity=f"{name}.{jname}",
                     table=junc.target,
                     mongo_count=_sum_array_length(db, entity.source, jname, mongo_filter),
                     postgres_count=_table_count(conn, junc.target),
+                    expected_skip=junction_skip,
                 )
             )
         for uname, unp in entity.unpivot.items():
@@ -282,10 +368,17 @@ def _recompute_field_value(
 ) -> Any:
     """Mirrors migrate/load.py's field resolution exactly (same transform,
     same lookup-via-id_map, same external-database routing for a
-    `mapping.external_databases` entity), but read-only: a lookup miss here
-    is reported as a mismatch rather than raised, since by validation time
-    the row is already loaded — if id_map no longer has the entry, that is
-    itself the finding, not a reason to crash."""
+    `mapping.external_databases` entity, same on_missing policy), but
+    read-only: an `on_missing=error` (the default) lookup miss here is
+    reported as a mismatch rather than raised, since by validation time the
+    row is already loaded — if id_map no longer has the entry, that is
+    itself the finding, not a reason to crash. `on_missing=null` returns
+    None here too, matching what load.py actually wrote — treating it as
+    `_LOOKUP_MISSING` instead would report a false mismatch on every single
+    row the policy correctly rescued, defeating the whole point of setting
+    it. (`on_missing=skip_row` needs no special case: a skipped document
+    never got an id_map entry, so `_sample_diffs`'s sampling — which reads
+    straight from id_map — never encounters it in the first place.)"""
     raw = get_nested(doc, key)
     if fspec.lookup:
         if raw is None:
@@ -301,7 +394,7 @@ def _recompute_field_value(
             id_map_schema = internal_schema
         target_id_str = idmap.get(id_map_conn, fspec.lookup, str(raw), schema=id_map_schema)
         if target_id_str is None:
-            return _LOOKUP_MISSING
+            return None if fspec.on_missing == OnMissing.NULL else _LOOKUP_MISSING
         col_type = pg_schema.tables[target_table].columns[fspec.target].data_type.lower()
         return _cast_for_column(target_id_str, col_type)
     value = apply_transform(fspec.transform, raw)
@@ -393,6 +486,126 @@ def _values_equal(a: Any, b: Any) -> bool:
     return _canonicalize(a) == _canonicalize(b)
 
 
+def _known_source_ids(conn: psycopg.Connection, lookup_entity: str, *, schema: str) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(f'SELECT source_id FROM "{schema}".id_map WHERE entity = %s', (lookup_entity,))
+        return {row[0] for row in cur.fetchall()}
+
+
+def _mongo_present_scalar_values(
+    db: Database, collection: str, explode_path: str | None, field_name: str, mongo_filter: dict
+) -> set[str]:
+    """All non-null values actually present at `field_name`, across every
+    matching document — `explode_path` (e.g. "facilities" or
+    "facilities.categoryParts") unwinds through that many nesting levels
+    first, so this covers a `lookup:` on an explode-level field too, not
+    just a top-level entity field. None for a top-level field."""
+    pipeline = [*([{"$match": mongo_filter}] if mongo_filter else [])]
+    prefix = ""
+    if explode_path:
+        segments = explode_path.split(".")
+        for i in range(len(segments)):
+            pipeline.append({"$unwind": f"${'.'.join(segments[: i + 1])}"})
+        prefix = f"{explode_path}."
+    full_field = f"{prefix}{field_name}"
+    pipeline.append({"$match": {full_field: {"$ne": None}}})
+    pipeline.append({"$project": {"v": f"${full_field}"}})
+    return {str(d["v"]) for d in db[collection].aggregate(pipeline)}
+
+
+def _mongo_present_array_values(db: Database, collection: str, field_name: str, mongo_filter: dict) -> set[str]:
+    """Every scalar value that appears anywhere in `field_name` (a
+    `junction` field — an array of scalar FKs), across all matching
+    documents. $unwind rather than $ne-null-and-project: this field is the
+    array itself, not a scalar that might be null."""
+    pipeline = [
+        *([{"$match": mongo_filter}] if mongo_filter else []),
+        {"$unwind": f"${field_name}"},
+        {"$project": {"v": f"${field_name}"}},
+    ]
+    return {str(d["v"]) for d in db[collection].aggregate(pipeline)}
+
+
+def _flatten_explode_for_on_missing(explode: dict, *, path_prefix: str = "") -> list[tuple[str, object]]:
+    # Same shape as _flatten_explode above, kept separate because it
+    # doesn't need ExplodeSpec's target — just its .fields and .explode.
+    out: list[tuple[str, object]] = []
+    for ename, exp in explode.items():
+        path = f"{path_prefix}.{ename}" if path_prefix else ename
+        out.append((path, exp))
+        out.extend(_flatten_explode_for_on_missing(exp.explode, path_prefix=path))
+    return out
+
+
+def _count_on_missing(
+    db: Database,
+    conn: psycopg.Connection,
+    mapping: MappingFile,
+    *,
+    internal_schema: str,
+    external_conns: dict[str, psycopg.Connection] | None = None,
+) -> list[OnMissingDiff]:
+    """Independently re-derives, right now, how many dangling references
+    each on_missing-enabled field/junction actually has — see
+    OnMissingDiff. Fields with the default on_missing=error are skipped
+    entirely: a dangling reference there is either already impossible (it
+    would have hard-failed migrate) or is genuinely new drift, which the
+    existing sample-diff mismatch path already surfaces via
+    _LOOKUP_MISSING — this function is specifically about the policy-
+    covered cases, which nothing else reports on at validate time."""
+    diffs: list[OnMissingDiff] = []
+    for name, entity in mapping.entities.items():
+        mongo_filter = entity.mongo_filter()
+
+        def _lookup_conn_and_schema(lookup_entity: str) -> tuple[psycopg.Connection, str]:
+            if lookup_entity in (external_conns or {}):
+                return external_conns[lookup_entity], idmap.DEFAULT_SCHEMA_NAME
+            return conn, internal_schema
+
+        for key, fspec in entity.fields.items():
+            if not fspec.lookup or fspec.on_missing == OnMissing.ERROR:
+                continue
+            id_map_conn, id_map_schema = _lookup_conn_and_schema(fspec.lookup)
+            known = _known_source_ids(id_map_conn, fspec.lookup, schema=id_map_schema)
+            present = _mongo_present_scalar_values(db, entity.source, None, key, mongo_filter)
+            dangling = len(present - known)
+            if dangling:
+                diffs.append(
+                    OnMissingDiff(entity=name, field=f"{name}.{key}", policy=fspec.on_missing.value, dangling_count=dangling)
+                )
+
+        for path, exp in _flatten_explode_for_on_missing(entity.explode):
+            for key, fspec in exp.fields.items():
+                if not fspec.lookup or fspec.on_missing == OnMissing.ERROR:
+                    continue
+                id_map_conn, id_map_schema = _lookup_conn_and_schema(fspec.lookup)
+                known = _known_source_ids(id_map_conn, fspec.lookup, schema=id_map_schema)
+                present = _mongo_present_scalar_values(db, entity.source, path, key, mongo_filter)
+                dangling = len(present - known)
+                if dangling:
+                    diffs.append(
+                        OnMissingDiff(
+                            entity=name, field=f"{name}.{path}.{key}", policy=fspec.on_missing.value,
+                            dangling_count=dangling,
+                        )
+                    )
+
+        for jname, junc in entity.junction.items():
+            if not junc.child_fk.lookup or junc.on_missing == OnMissing.ERROR:
+                continue
+            id_map_conn, id_map_schema = _lookup_conn_and_schema(junc.child_fk.lookup)
+            known = _known_source_ids(id_map_conn, junc.child_fk.lookup, schema=id_map_schema)
+            present = _mongo_present_array_values(db, entity.source, jname, mongo_filter)
+            dangling = len(present - known)
+            if dangling:
+                diffs.append(
+                    OnMissingDiff(
+                        entity=name, field=f"{name}.{jname}", policy=junc.on_missing.value, dangling_count=dangling
+                    )
+                )
+    return diffs
+
+
 def _refetch_mongo_doc(db: Database, entity: EntityMapping, source_id_str: str) -> dict | None:
     from bson.errors import InvalidId
     from bson.objectid import ObjectId
@@ -437,12 +650,20 @@ def validate(
                         f'"{internal_schema}" schema not found — has `migrate` been run yet?'
                     )
 
-            count_diffs = _count_diffs(db, conn, mapping)
+            count_diffs = _count_diffs(
+                db, conn, mapping, internal_schema=internal_schema, external_conns=external_conns,
+            )
             sample_diffs, sampled_rows = _sample_diffs(
                 db, conn, mapping, pg_schema, sample_size=sample_size, internal_schema=internal_schema,
                 external_conns=external_conns,
             )
-        return ValidationReport(count_diffs=count_diffs, sample_diffs=sample_diffs, sampled_rows=sampled_rows)
+            on_missing_diffs = _count_on_missing(
+                db, conn, mapping, internal_schema=internal_schema, external_conns=external_conns,
+            )
+        return ValidationReport(
+            count_diffs=count_diffs, sample_diffs=sample_diffs, sampled_rows=sampled_rows,
+            on_missing_diffs=on_missing_diffs,
+        )
     finally:
         client.close()
         close_external_connections(external_conns)

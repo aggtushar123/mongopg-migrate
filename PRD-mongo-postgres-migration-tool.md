@@ -50,6 +50,7 @@ Teams migrating from MongoDB to a normalized PostgreSQL schema face a specific, 
 | Junction-table **mapping** (not generation — the join table must already exist in the target DDL, per §4's non-goal) for scalar-ID arrays (e.g. `tagIds: [ObjectId]` → existing `post_tags` table), FKs remapped via the same `id_strategy` lookup as regular explode | P0 |
 | Unpivot mapping — N differently-named top-level scalar fields (e.g. `pfAmount`/`payToHospital`/`finalBill`) → N rows in an existing table, each carrying a literal code identifying which source field it came from (the EAV/pivot-normalization pattern). Distinct from both `explode` (one array, one repeated shape) and `junction` (one array of scalar FKs) — neither can express "several differently-named fields, each becoming its own row" | P0 |
 | Explode/junction array-shape safety: a scalar value where an array is expected (e.g. a plain string mistakenly mapped via `junction:` instead of `fields: {lookup:}`) is rejected loudly — at dry-run as a flagged violation, at migrate time as a hard failure — never silently iterated (a string is technically iterable character-by-character in the host language; that must never become the actual migration behavior) | P0 |
+| `on_missing: error\|null\|skip_row` policy for a *dangling* `lookup:` (the source field points at a real value, but nothing resolves it — e.g. the referenced document was deleted). Distinct from the field being absent/null in the first place, which was already fine (NULL in, NULL out). Default `error` (unchanged prior behavior — hard-fail migrate, block dry-run); `null` writes NULL (still subject to the target column's NOT NULL check — this can't rescue a real schema mismatch); `skip_row` drops the row the field's value belongs to (the whole document for a top-level field, one array item for an `explode` field, one row for a `junction` — `junction` supports only `error`/`skip_row`, never `null`, since `child_fk` is half the row's own identity). Every occurrence is counted and reported — at migrate, at dry-run (as an informational notice, not a blocking violation), and independently re-derived at `validate` time (count-diff reconciled against the known skip_row reduction; sample-diff correctly matches a null-rescued row instead of false-flagging it) — a silent null-ing/skipping here would be the exact bug class this tool exists to prevent | P0 |
 | Small transform DSL in the mapping file: cast, default, split, `json_extract`, enum mapping | P0 |
 | Polymorphic document detection (shape variance within one collection) + support for multiple mappings filtered by discriminator | P0 |
 | Human-editable mapping file (YAML/JSON) with a worked example checked into the repo (see §12) | P0 |
@@ -106,6 +107,7 @@ Teams migrating from MongoDB to a normalized PostgreSQL schema face a specific, 
 - **Sampling bias**: a small sample can miss rare type variance and rare polymorphic shapes on large collections, producing a mapping that looks confident but breaks on the full load. Sample size needs to scale with collection size (or scan fully below a size threshold), and dry-run against the full dataset — not just the sample — is what actually catches this before commit.
 - **Large collections**: sampling strategy must balance inference accuracy vs. introspection cost on very large collections.
 - **ID remapping correctness**: if `id_strategy` changes the primary key (e.g. ObjectId → serial), every referencing collection/field must be remapped consistently via the same lookup, including references embedded inside documents that don't correspond 1:1 to a Postgres FK — a bug here causes silent orphaned or misattributed rows, not a visible failure.
+- **Dangling references**: real Mongo data accumulates `lookup:` references to documents that no longer exist (soft/hard deletes upstream, inconsistent cleanup) — the default (`on_missing: error`, §7/§12.3) surfaces this loudly rather than writing a wrong or orphaned FK, but a team choosing `null`/`skip_row` to unblock a migration must not lose visibility into how much data that policy is actually touching — mitigated by counting and reporting every occurrence at migrate, dry-run, and validate, never silently.
 - **LLM privacy**: needs a clear default (off, or metadata-only) so the tool is safe to use on production data by default.
 - **Circular foreign keys**: a true FK cycle in the target schema breaks strict parent-before-child load ordering. v1 requires the schema to mark such cycles `DEFERRABLE` (loaded within a deferred-constraint transaction); an un-deferrable cycle is a flagged error at dry-run, not something the tool silently reorders around.
 - **Existing-data / truncate footguns**: a one-time migration tool defaulting to destructive writes against a target that turns out to be non-empty (e.g. re-run after a partial failure, or pointed at the wrong database) is a real incident risk — mitigated by the `--mode` requirement in §6/§7 (no silent truncate on non-empty tables).
@@ -303,3 +305,27 @@ entities:
 ```
 
 Note this example is meant to pin down for implementers: `(parent_fk, code)` is a genuine natural key for an unpivot child row — unlike an `explode` child's synthetic `serial` PK, which has no natural conflict target — so `--mode upsert` (§7 P1) is meaningful here: re-running against a document whose `pfAmount` changed updates that one row in place rather than duplicating it.
+
+### 12.3 `on_missing` — a dangling `lookup:` reference
+
+Real-world shape this exists for: a `KycVerificationStep.mcmUserId` pointing at an `McmUser` document that no longer exists (deleted, or never migrated). `lookup:` fields had exactly one behavior before this — hard-fail the whole batch — with no way to say "I know about this specific, bounded data-quality gap; here's what to do about it."
+
+Mapping:
+```yaml
+entities:
+  kyc_steps:
+    source: kycVerificationSteps
+    target: kyc_step
+    id_strategy: { type: objectid_to_uuid, source_field: _id }
+    fields:
+      mcmUserId:
+        target: user_id
+        lookup: mcm_user
+        on_missing: null    # writes NULL for a dangling reference, instead of hard-failing
+```
+
+Note this example is meant to pin down for implementers:
+- `on_missing` has three values: `error` (default, unchanged prior behavior), `null` (write NULL — still subject to the target column's own NOT NULL check, which a policy decision can't override), `skip_row` (drop the row the field's value belongs to). It only applies to a `lookup:` field/junction — a dangling reference is specifically "the lookup target has no matching `id_map` row," which only means something when there's a lookup to dangle.
+- Granularity of `skip_row` depends on where the field lives: a top-level entity field drops the whole document (and everything derived from it — its `explode`/`junction`/`unpivot` children, its `id_map` entry); an `explode`-level field drops just that one array item, not its parent or siblings; a `junction`'s `child_fk` drops just that one join row — `junction.on_missing` therefore only accepts `error`/`skip_row`, never `null` (the child_fk *is* half the row's own identity; there's no such thing as "the row, but with a null identity").
+- Every `on_missing` outcome (rescued to NULL, or a row dropped) is counted and reported — at `migrate` time in its own output, at `dry-run` as an informational, non-blocking notice (so dry-run stays clean for a data-quality gap the user already explicitly decided how to handle, rather than keep flagging it), and independently re-derived at `validate` time from live Mongo + `id_map` (not a copy of migrate's own in-memory tally, so it also catches drift — e.g. the referenced entity deleted *after* a successful migration). A silent null-ing/skipping with no visibility would be the exact bug class this tool exists to prevent (PRD §9 "zero silent data loss") — counts matching while data is quietly wrong.
+- `validate`'s count diff reconciles a `skip_row` policy's known, deliberate row reduction (`mongo_count - expected_skip == postgres_count`) rather than reporting an intentional, policy-covered drop as an unexplained mismatch indistinguishable from real data loss.

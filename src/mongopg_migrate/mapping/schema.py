@@ -25,10 +25,45 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+class OnMissing(str, Enum):
+    """Policy for a `lookup:` that resolves to no `_mongopg.id_map` row — a
+    *dangling reference* (the source field points at a real value, but the
+    entity it should resolve against has no matching row, e.g. it was
+    deleted, or was never migrated). Distinct from the field being absent/
+    null on the source document, which was already handled fine before this
+    existed (NULL in, NULL out, subject to the target column's NOT NULL
+    check) — a dangling reference is a data-quality problem the tool
+    previously had no policy for at all: it just hard-failed the whole
+    batch (`LoadError`), unconditionally, with no way to say "I know about
+    this, here's what to do."
+
+    - ERROR (default): unchanged prior behavior — hard-fail migrate,
+      report a violation at dry-run. Never silently proceed past a
+      dangling reference unless a policy explicitly says to.
+    - NULL: write NULL for this field. Still subject to the target
+      column's NOT NULL check same as any other null value — this can't
+      rescue a NOT NULL column, and shouldn't: that's a real schema
+      mismatch, not a policy decision. Every occurrence is counted and
+      reported (migrate output, dry-run, and `validate`'s on_missing
+      section) — a silent null-ing here would be the exact bug class this
+      tool exists to prevent (counts match, data is quietly wrong).
+    - SKIP_ROW: drop the row this field's value belongs to, rather than
+      writing it at all. For a top-level entity field, that's the whole
+      document (and everything derived from it — explode/junction/unpivot
+      children, its id_map entry). For an `explode` field, that's just the
+      one array item, not its parent or siblings. Also counted and
+      reported, same as NULL.
+    """
+
+    ERROR = "error"
+    NULL = "null"
+    SKIP_ROW = "skip_row"
 
 
 class IdStrategyType(str, Enum):
@@ -79,6 +114,9 @@ class FieldSpec(BaseModel):
     # Name of another entity in this mapping file whose id_strategy lookup
     # (i.e. a row in _mongopg.id_map) resolves this field's value. PRD §12.
     lookup: str | None = None
+    # See OnMissing — only meaningful (and only accepted) alongside `lookup`;
+    # a plain field has no "dangling reference" concept to have a policy on.
+    on_missing: OnMissing = OnMissing.ERROR
 
     @classmethod
     def coerce(cls, value: Any) -> FieldSpec:
@@ -87,6 +125,29 @@ class FieldSpec(BaseModel):
         if isinstance(value, FieldSpec):
             return value
         return cls(**value)
+
+    @field_validator("on_missing", mode="before")
+    @classmethod
+    def _coerce_bare_yaml_null(cls, v: Any) -> Any:
+        # `on_missing: null` (no quotes) is the single most natural way to
+        # write this policy — and YAML parses a bare, unquoted `null` as
+        # Python None, not the string "null". Without this, that entirely
+        # reasonable spelling would fail with a confusing enum-validation
+        # error instead of doing what it obviously means. `on_missing: None`
+        # meaning "don't set on_missing" isn't a real use case — omitting
+        # the key entirely already means that (defaults to `error`) — so
+        # there's no ambiguity being papered over here.
+        return "null" if v is None else v
+
+    @model_validator(mode="after")
+    def _on_missing_requires_lookup(self) -> FieldSpec:
+        if self.on_missing != OnMissing.ERROR and not self.lookup:
+            raise ValueError(
+                f"on_missing={self.on_missing.value!r} only applies to a `lookup:` field — a dangling "
+                "reference is specifically 'the lookup target has no matching id_map row', which only "
+                "means something when there's a lookup to dangle. Add `lookup:` or drop `on_missing:`."
+            )
+        return self
 
 
 def _normalize_field_map(v: Any) -> dict[str, Any]:
@@ -165,11 +226,28 @@ class JunctionSpec(BaseModel):
     Distinct from ExplodeSpec: a junction field has no independent payload
     fields of its own (it's just an array of foreign IDs), so there is no
     `fields` map — only the two FK sides.
+
+    `on_missing` covers a dangling `child_fk.lookup` (see OnMissing) — but
+    only `error`/`skip_row` are valid here, not `null`: a junction row's
+    child_fk *is* half the row's identity (parent_fk, child_fk together are
+    the natural key), so there's no such thing as "the row, but with a null
+    identity" the way there is for a normal field. `skip_row` here means
+    dropping just that one junction row, not the parent entity's row.
     """
 
     target: str
     parent_fk: ForeignKeyRef
     child_fk: ForeignKeyRef
+    on_missing: Literal[OnMissing.ERROR, OnMissing.SKIP_ROW] = OnMissing.ERROR
+
+    @model_validator(mode="after")
+    def _on_missing_requires_child_lookup(self) -> JunctionSpec:
+        if self.on_missing != OnMissing.ERROR and not self.child_fk.lookup:
+            raise ValueError(
+                f"on_missing={self.on_missing.value!r} only applies when `child_fk.lookup` is set — "
+                "a dangling reference only means something when child_fk resolves via a lookup."
+            )
+        return self
 
 
 class UnpivotItem(BaseModel):

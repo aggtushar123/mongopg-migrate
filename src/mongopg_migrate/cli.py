@@ -321,7 +321,9 @@ def dry_run_cmd(
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
 
-    for v in report.violations:
+    errors = [v for v in report.violations if v.severity == "error"]
+    infos = [v for v in report.violations if v.severity != "error"]
+    for v in errors:
         loc = f"{v.entity}" + (f".{v.field}" if v.field else "")
         click.echo(f"[{v.layer}] [{loc}] {v.message}", err=True)
     if report.truncated:
@@ -332,8 +334,18 @@ def dry_run_cmd(
         )
 
     if not report.ok:
-        click.echo(f"\n{len(report.violations)} violation(s) found — do not run migrate yet.", err=True)
+        click.echo(f"\n{len(errors)} violation(s) found — do not run migrate yet.", err=True)
         sys.exit(1)
+
+    if infos:
+        # on_missing=null/skip_row lookup misses — not a reason to withhold
+        # a clean bill of health (the user already decided how to handle
+        # these), but still worth surfacing so migrate's behavior isn't a
+        # surprise.
+        click.echo(f"\n{len(infos)} known data-quality gap(s), covered by an explicit on_missing policy:", err=True)
+        for v in infos:
+            loc = f"{v.entity}" + (f".{v.field}" if v.field else "")
+            click.echo(f"  [{v.layer}] [{loc}] {v.message}", err=True)
     click.echo("\nOK — dry-run found no violations.", err=True)
 
 
@@ -426,6 +438,28 @@ def migrate_cmd(
         else:
             resumed = f", resumed after {r.resumed_from}" if r.resumed_from else ""
             click.echo(f"  {r.entity}: {r.rows_loaded} row(s) loaded{resumed}", err=True)
+        # Every on_missing outcome is counted and reported here — a silent
+        # null-ing/skipping would be the exact bug class this tool exists
+        # to prevent (counts match, data is quietly wrong).
+        if r.nulled_lookups:
+            for field_path, count in sorted(r.nulled_lookups.items()):
+                click.echo(
+                    f"    NOTE: {count} dangling lookup(s) on {field_path} written as NULL "
+                    "(on_missing: null)",
+                    err=True,
+                )
+        if r.rows_skipped:
+            click.echo(f"    NOTE: {r.rows_skipped} document(s) skipped entirely (on_missing: skip_row)", err=True)
+        if r.skipped_lookups:
+            # Includes rows_skipped's own field(s) plus finer-grained
+            # skip_row skips that never dropped a whole document: one
+            # exploded array item, or one junction row.
+            for field_path, count in sorted(r.skipped_lookups.items()):
+                click.echo(
+                    f"    NOTE: {count} row(s)/item(s) dropped due to a dangling lookup on {field_path} "
+                    "(on_missing: skip_row)",
+                    err=True,
+                )
     click.echo(
         "\nRun `validate` (PRD §6 step 7) to check counts and value-level diffs before "
         "trusting this migration.",
@@ -465,7 +499,11 @@ def validate_cmd(
     click.echo("Count diff:", err=True)
     for c in report.count_diffs:
         marker = "OK" if c.matches else "MISMATCH"
-        click.echo(f"  [{marker}] {c.entity} ({c.table}): mongo={c.mongo_count} postgres={c.postgres_count}", err=True)
+        skip_note = f" (-{c.expected_skip} expected from on_missing=skip_row)" if c.expected_skip else ""
+        click.echo(
+            f"  [{marker}] {c.entity} ({c.table}): mongo={c.mongo_count} postgres={c.postgres_count}{skip_note}",
+            err=True,
+        )
 
     click.echo(f"\nSample diff ({report.sampled_rows} row(s) sampled):", err=True)
     if report.sample_diffs:
@@ -473,6 +511,15 @@ def validate_cmd(
             click.echo(f"  [MISMATCH] {d.entity} source_id={d.source_id}: {', '.join(d.mismatched_fields)}", err=True)
     else:
         click.echo("  no mismatches", err=True)
+
+    if report.on_missing_diffs:
+        # Informational only — never affects report.ok. Re-derived fresh
+        # from live Mongo + id_map, so this also catches drift since
+        # migrate ran (e.g. the referenced entity was deleted after a
+        # successful migration), not just what happened at load time.
+        click.echo("\nOn-missing policy summary (re-derived from live data, informational):", err=True)
+        for d in report.on_missing_diffs:
+            click.echo(f"  {d.field}: {d.dangling_count} dangling reference(s) currently (on_missing: {d.policy})", err=True)
 
     if not report.ok:
         click.echo("\nValidation FAILED — do not trust this migration as-is.", err=True)

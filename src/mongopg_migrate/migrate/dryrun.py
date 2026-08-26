@@ -54,6 +54,7 @@ from mongopg_migrate.mapping.schema import (
     ExplodeSpec,
     FieldSpec,
     MappingFile,
+    OnMissing,
     UnpivotSpec,
 )
 from mongopg_migrate.migrate import idmap
@@ -80,6 +81,14 @@ class DryRunViolation:
     layer: str  # "fast" | "realistic"
     field: str | None
     message: str
+    # "error" (default): would fail migrate, blocks a clean dry-run. "info":
+    # a dangling lookup covered by an explicit on_missing policy (null/
+    # skip_row) — reported so the user sees exactly what will happen, but
+    # not a reason to withhold a clean bill of health. Reporting these as
+    # ordinary "error" violations would defeat the whole point of setting
+    # the policy: dry-run would keep complaining about refs the user
+    # already explicitly decided how to handle.
+    severity: str = "error"
 
 
 @dataclass
@@ -89,7 +98,7 @@ class DryRunReport:
 
     @property
     def ok(self) -> bool:
-        return not self.violations
+        return not any(v.severity == "error" for v in self.violations)
 
 
 # --- Layer A: fast pass -------------------------------------------------------
@@ -307,16 +316,45 @@ def _validate_field(
 
     if fspec.lookup:
         if raw is not None and str(raw) not in found.get(fspec.lookup, set()):
-            violations.append(
-                DryRunViolation(
-                    entity=context,
-                    layer="fast",
-                    field=key,
-                    message=f"lookup miss: {fspec.lookup}/{raw!r} not found in the {fspec.lookup!r} "
-                    "source collection — this would fail at migrate time",
+            # A *dangling* reference (raw is present, but nothing resolves it) —
+            # distinct from raw being absent/null in the first place, which is
+            # not this branch at all. What happens next depends entirely on
+            # on_missing: this must mirror migrate/load.py's _resolve_lookup
+            # exactly, or dry-run either keeps blocking on refs the user
+            # already explicitly decided how to handle, or — worse — stays
+            # silent about something migrate will actually do.
+            if fspec.on_missing == OnMissing.NULL:
+                violations.append(
+                    DryRunViolation(
+                        entity=context, layer="fast", field=key, severity="info",
+                        message=f"lookup miss: {fspec.lookup}/{raw!r} not found — on_missing=null will "
+                        "write NULL here at migrate time",
+                    )
                 )
-            )
-        value = raw
+                value = None
+            elif fspec.on_missing == OnMissing.SKIP_ROW:
+                violations.append(
+                    DryRunViolation(
+                        entity=context, layer="fast", field=key, severity="info",
+                        message=f"lookup miss: {fspec.lookup}/{raw!r} not found — on_missing=skip_row "
+                        "will drop this row at migrate time",
+                    )
+                )
+                return violations  # row would be skipped entirely — no NOT NULL check to run
+            else:
+                violations.append(
+                    DryRunViolation(
+                        entity=context,
+                        layer="fast",
+                        field=key,
+                        message=f"lookup miss: {fspec.lookup}/{raw!r} not found in the {fspec.lookup!r} "
+                        "source collection — this would fail at migrate time (set `on_missing: null` or "
+                        "`on_missing: skip_row` if this is a known, acceptable data-quality gap)",
+                    )
+                )
+                value = raw
+        else:
+            value = raw
     else:
         try:
             value = apply_transform(fspec.transform, raw)
@@ -521,15 +559,27 @@ def run_fast_pass(
                             if child_source is not None and str(child_source) not in found.get(
                                 junc.child_fk.lookup, set()
                             ):
-                                violations.append(
-                                    DryRunViolation(
-                                        entity=entity_name,
-                                        layer="fast",
-                                        field=jname,
-                                        message=f"junction lookup miss: {junc.child_fk.lookup}/"
-                                        f"{child_source!r} not found — this would fail at migrate time",
+                                if junc.on_missing == OnMissing.SKIP_ROW:
+                                    violations.append(
+                                        DryRunViolation(
+                                            entity=entity_name, layer="fast", field=jname, severity="info",
+                                            message=f"junction lookup miss: {junc.child_fk.lookup}/"
+                                            f"{child_source!r} not found — on_missing=skip_row will drop "
+                                            "just this junction row at migrate time",
+                                        )
                                     )
-                                )
+                                else:
+                                    violations.append(
+                                        DryRunViolation(
+                                            entity=entity_name,
+                                            layer="fast",
+                                            field=jname,
+                                            message=f"junction lookup miss: {junc.child_fk.lookup}/"
+                                            f"{child_source!r} not found — this would fail at migrate time "
+                                            "(set `on_missing: skip_row` on this junction if this is a "
+                                            "known, acceptable data-quality gap)",
+                                        )
+                                    )
 
                     for uname, unp in entity.unpivot.items():
                         violations.extend(
