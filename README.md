@@ -1,5 +1,8 @@
 # mongopg-migrate
 
+[![CI](https://github.com/aggtushar123/mongopg-migrate/actions/workflows/ci.yml/badge.svg)](https://github.com/aggtushar123/mongopg-migrate/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 Map MongoDB collections onto an **existing, independently designed**
 PostgreSQL schema, and run a validated, repeatable data migration — without
 hand-writing a transform script.
