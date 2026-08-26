@@ -52,7 +52,13 @@ from pymongo import MongoClient
 from pymongo.database import Database
 
 from mongopg_migrate.introspect.postgres import PostgresSchema
-from mongopg_migrate.mapping.schema import EntityMapping, FieldSpec, MappingFile
+from mongopg_migrate.mapping.schema import (
+    EntityMapping,
+    ExplodeSpec,
+    FieldSpec,
+    MappingFile,
+    UnpivotSpec,
+)
 from mongopg_migrate.migrate import idmap
 from mongopg_migrate.migrate.load import (
     LoadError,
@@ -118,6 +124,53 @@ def _sum_array_length(db: Database, collection: str, field_name: str, mongo_filt
     return result[0]["total"] if result else 0
 
 
+def _flatten_explode(explode: dict[str, ExplodeSpec], *, path_prefix: str = "") -> list[tuple[str, ExplodeSpec]]:
+    # Mirrors migrate/load.py's / migrate/dryrun.py's private helper of the
+    # same name (parent-before-child pre-order) — kept as a separate small
+    # copy rather than importing a leading-underscore name across modules.
+    out: list[tuple[str, ExplodeSpec]] = []
+    for ename, exp in explode.items():
+        path = f"{path_prefix}.{ename}" if path_prefix else ename
+        out.append((path, exp))
+        out.extend(_flatten_explode(exp.explode, path_prefix=path))
+    return out
+
+
+def _sum_nested_array_length(db: Database, collection: str, path: str, mongo_filter: dict) -> int:
+    """Row count for a (possibly nested) explode path, e.g.
+    "facilities.categoryParts" — one `$unwind` per path segment, so a
+    document missing (or with an empty) array at any level simply
+    contributes 0 rather than erroring, matching `_sum_array_length`'s
+    treatment of a top-level missing array."""
+    segments = path.split(".")
+    pipeline = [*([{"$match": mongo_filter}] if mongo_filter else [])]
+    for i in range(len(segments)):
+        pipeline.append({"$unwind": f"${'.'.join(segments[: i + 1])}"})
+    pipeline.append({"$count": "n"})
+    result = list(db[collection].aggregate(pipeline))
+    return result[0]["n"] if result else 0
+
+
+def _sum_unpivot_rows(db: Database, collection: str, unp: UnpivotSpec, mongo_filter: dict) -> int:
+    """Mirrors load.py's per-item skip_null check: an item with skip_null=True
+    (the spec-level default, applied per item) contributes a row only when its
+    source field is present and non-null; skip_null=False contributes one row
+    per matching document regardless of that field's value."""
+    total = 0
+    for item in unp.items:
+        if unp.skip_null:
+            pipeline = [
+                *([{"$match": mongo_filter}] if mongo_filter else []),
+                {"$match": {item.source_field: {"$ne": None}}},
+                {"$count": "n"},
+            ]
+            result = list(db[collection].aggregate(pipeline))
+            total += result[0]["n"] if result else 0
+        else:
+            total += db[collection].count_documents(mongo_filter)
+    return total
+
+
 def _count_diffs(db: Database, conn: psycopg.Connection, mapping: MappingFile) -> list[CountDiff]:
     diffs: list[CountDiff] = []
     for name, entity in mapping.entities.items():
@@ -135,12 +188,12 @@ def _count_diffs(db: Database, conn: psycopg.Connection, mapping: MappingFile) -
                 postgres_count=_table_count(conn, entity.target),
             )
         )
-        for ename, exp in entity.explode.items():
+        for path, exp in _flatten_explode(entity.explode):
             diffs.append(
                 CountDiff(
-                    entity=f"{name}.{ename}",
+                    entity=f"{name}.{path}",
                     table=exp.target,
-                    mongo_count=_sum_array_length(db, entity.source, ename, mongo_filter),
+                    mongo_count=_sum_nested_array_length(db, entity.source, path, mongo_filter),
                     postgres_count=_table_count(conn, exp.target),
                 )
             )
@@ -151,6 +204,15 @@ def _count_diffs(db: Database, conn: psycopg.Connection, mapping: MappingFile) -
                     table=junc.target,
                     mongo_count=_sum_array_length(db, entity.source, jname, mongo_filter),
                     postgres_count=_table_count(conn, junc.target),
+                )
+            )
+        for uname, unp in entity.unpivot.items():
+            diffs.append(
+                CountDiff(
+                    entity=f"{name}.{uname}",
+                    table=unp.target,
+                    mongo_count=_sum_unpivot_rows(db, entity.source, unp, mongo_filter),
+                    postgres_count=_table_count(conn, unp.target),
                 )
             )
     return diffs

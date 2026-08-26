@@ -28,12 +28,17 @@ both of which have a natural conflict target (the entity's own PK; the
 junction's two FK columns, which must have a matching unique constraint —
 Postgres errors loudly if not, which is correct: that's a real schema gap,
 not something to paper over). `explode` child tables always plain-COPY
-regardless of mode: their PK is a synthetic `SERIAL` with no natural key
-derivable from the source document to conflict on, so there is nothing
-honest to upsert against — re-running `upsert` re-inserts new child rows
-exactly like `append` would (checkpoint/resume already prevents this from
-duplicating within one logical run; a deliberate second run over the same
-already-loaded documents is a `truncate` situation, not an `upsert` one).
+regardless of mode. For a leaf level this is because its PK is a synthetic
+`SERIAL` with no natural key derivable from the source document to conflict
+on; a level with nested `explode` children DOES resolve a real, deterministic
+id up front (see `_collect_explode_rows` — needed to thread that id down to
+the nested level's `parent_fk`), but still isn't upserted against it here —
+that would be a reasonable future extension, not a correctness gap: there is
+nothing *wrong* about always-insert, just something not yet offered. Either
+way, re-running `upsert` re-inserts new child rows exactly like `append`
+would (checkpoint/resume already prevents this from duplicating within one
+logical run; a deliberate second run over the same already-loaded documents
+is a `truncate` situation, not an `upsert` one).
 
 `entity.unmapped.jsonb` is a real landing, not a label: every field listed
 there is serialized into one JSON object and written to
@@ -78,7 +83,13 @@ from pymongo import MongoClient
 from pymongo.database import Database
 
 from mongopg_migrate.introspect.postgres import PostgresSchema
-from mongopg_migrate.mapping.schema import EntityMapping, FieldSpec, MappingFile
+from mongopg_migrate.mapping.schema import (
+    EntityMapping,
+    ExplodeSpec,
+    FieldSpec,
+    MappingFile,
+    UnpivotItem,
+)
 from mongopg_migrate.migrate import checkpoint, idmap
 from mongopg_migrate.migrate.idstrategy import resolve_new_id
 from mongopg_migrate.migrate.transform import apply_default, apply_transform, get_nested, json_safe
@@ -115,6 +126,127 @@ def _cast_for_column(value_str: str, data_type: str):
     if data_type in ("integer", "bigint", "smallint") or "serial" in data_type:
         return int(value_str)
     return value_str
+
+
+def _require_array(doc: dict, field_name: str, *, context: str) -> list:
+    """`explode`/`junction` fields must be a real Mongo array. This exists
+    because `doc.get(field_name) or []` — the obvious way to write "iterate
+    it, or nothing if absent" — silently does the wrong thing for a scalar:
+    a non-empty string is truthy, so `or []` never fires, and Python then
+    iterates the string *character by character* ("CARDIOLOGY" -> 10 rows,
+    one per letter, no error). A dict would iterate its keys, same problem.
+    Found via a real mapping that used `junction:` for what was actually a
+    single scalar reference (which belongs in `fields:` with `lookup:`
+    instead) — this turns that into a loud, specific error instead of
+    quietly wrong data.
+    """
+    value = doc.get(field_name)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise LoadError(
+            f"{context}: field {field_name!r} is not an array (got {type(value).__name__}: {value!r}) — "
+            "explode/junction fields must be a real Mongo array. A single scalar reference belongs in "
+            "`fields:` with `lookup:` instead of `junction:`."
+        )
+    return value
+
+
+def _flatten_explode(explode: dict[str, ExplodeSpec], *, path_prefix: str = "") -> list[tuple[str, ExplodeSpec]]:
+    """Flattens a (possibly nested) explode tree into (path, spec) pairs in
+    top-down, parent-before-child order — a pre-order DFS guarantees that,
+    since a level always appears before anything under its own `explode`.
+    That order matters for COPY: a nested level's rows FK-reference the
+    parent level's just-written rows within the same uncommitted
+    transaction, so the parent's COPY must run first. `path` is dotted
+    (e.g. "facilities.categoryParts") purely as a unique accumulator key —
+    it's never written anywhere, just used to keep each level's rows in
+    their own bucket during a batch.
+    """
+    out: list[tuple[str, ExplodeSpec]] = []
+    for ename, exp in explode.items():
+        path = f"{path_prefix}.{ename}" if path_prefix else ename
+        out.append((path, exp))
+        out.extend(_flatten_explode(exp.explode, path_prefix=path))
+    return out
+
+
+def _collect_explode_rows(
+    parent_value: object,
+    items: list,
+    exp: ExplodeSpec,
+    *,
+    path: str,
+    context: str,
+    conn: psycopg.Connection,
+    pg_schema: PostgresSchema,
+    id_buffers: dict[str, dict[str, list[int]]],
+    explode_rows: dict[str, list[tuple]],
+    internal_schema: str,
+    external_conns: dict[str, psycopg.Connection] | None,
+) -> None:
+    """Builds this level's rows for one parent document's array, recursing
+    into any nested `explode` children. Only a level WITH nested children
+    resolves+writes its own id up front (schema.py already rejects `serial`
+    on such a level, so `resolve_new_id` is always usable here); a leaf
+    level keeps relying on Postgres's own SERIAL default, exactly as before
+    nesting existed — `own_id_value` stays None and is simply not written.
+    """
+    has_children = bool(exp.explode)
+    id_col_default = None
+    if has_children:
+        table_schema = pg_schema.tables.get(exp.target)
+        id_col = exp.id_strategy.target_field
+        if table_schema is not None and id_col in table_schema.columns:
+            id_col_default = table_schema.columns[id_col].default
+
+    for item in items:
+        row: list = [parent_value]
+        own_id_value = None
+        if has_children:
+            source_field = exp.id_strategy.source_field or "_id"
+            source_val = get_nested(item, source_field)
+            resolved = resolve_new_id(
+                exp.id_strategy,
+                source_val,
+                conn=conn,
+                column_default=id_col_default,
+                id_buffer=id_buffers.setdefault(path, {}),
+            )
+            own_id_value = resolved.column_value
+            row.append(own_id_value)
+        for k, fspec in exp.fields.items():
+            row.append(
+                _resolve_field_value(
+                    item,
+                    k,
+                    fspec,
+                    context=f"{context}.{path}",
+                    conn=conn,
+                    pg_schema=pg_schema,
+                    target_table=exp.target,
+                    internal_schema=internal_schema,
+                    external_conns=external_conns,
+                )
+            )
+        explode_rows[path].append(tuple(row))
+
+        for nested_ename, nested_exp in exp.explode.items():
+            nested_path = f"{path}.{nested_ename}"
+            nested_items = _require_array(item, nested_ename, context=f"{context}.{path}")
+            _collect_explode_rows(
+                own_id_value,
+                nested_items,
+                nested_exp,
+                path=nested_path,
+                context=context,
+                conn=conn,
+                pg_schema=pg_schema,
+                id_buffers=id_buffers,
+                explode_rows=explode_rows,
+                internal_schema=internal_schema,
+                external_conns=external_conns,
+            )
 
 
 def _resolve_lookup(
@@ -196,6 +328,29 @@ def _resolve_field_value(
 
 def _build_jsonb_payload(doc: dict, jsonb_fields: list[str]) -> Jsonb:
     return Jsonb({f: json_safe(get_nested(doc, f)) for f in jsonb_fields})
+
+
+def _resolve_unpivot_value(
+    doc: dict,
+    item: UnpivotItem,
+    *,
+    context: str,
+    pg_schema: PostgresSchema,
+    target_table: str,
+    value_column: str,
+):
+    raw = get_nested(doc, item.source_field)
+    value = apply_transform(item.transform, raw)
+    value = apply_default(item.transform, value)
+    if value is None:
+        col = pg_schema.tables.get(target_table, None)
+        col_info = col.columns.get(value_column) if col else None
+        if col_info is not None and not col_info.is_nullable:
+            raise LoadError(
+                f"{context}: null value for NOT NULL column {target_table}.{value_column} "
+                f"(source field {item.source_field!r} missing/null and no `default:` transform set)"
+            )
+    return value
 
 
 def _copy_rows(conn: psycopg.Connection, table: str, columns: list[str], rows: list[tuple]) -> None:
@@ -284,8 +439,9 @@ def _mapped_tables(mapping: MappingFile) -> set[str]:
     tables: set[str] = set()
     for entity in mapping.entities.values():
         tables.add(entity.target)
-        tables.update(exp.target for exp in entity.explode.values())
+        tables.update(exp.target for _, exp in _flatten_explode(entity.explode))
         tables.update(junc.target for junc in entity.junction.values())
+        tables.update(unp.target for unp in entity.unpivot.values())
     return tables
 
 
@@ -347,13 +503,29 @@ def _load_entity_batches(
             )
         main_columns = main_columns + [jsonb_column]
 
+    # Flattened once, up front — same flattened list is reused for both the
+    # per-batch column layout (below) and the write-order loop at the end of
+    # each batch, since _flatten_explode already returns parent-before-child.
+    flattened_explode = _flatten_explode(entity.explode)
     explode_columns = {
-        ename: [exp.parent_fk.target_field] + [exp.fields[k].target for k in exp.fields]
-        for ename, exp in entity.explode.items()
+        path: (
+            [exp.parent_fk.target_field]
+            + ([exp.id_strategy.target_field] if exp.explode else [])
+            + [exp.fields[k].target for k in exp.fields]
+        )
+        for path, exp in flattened_explode
     }
+    # Persists across every batch of this entity's load, same reasoning as
+    # the main `id_buffer` above — one int_sequence block reservation per
+    # nested-explode-with-children level, not per document.
+    explode_id_buffers: dict[str, dict[str, list[int]]] = {}
     junction_columns = {
         jname: [junc.parent_fk.target_field, junc.child_fk.target_field]
         for jname, junc in entity.junction.items()
+    }
+    unpivot_columns = {
+        uname: [unp.parent_fk.target_field, unp.code_column, unp.value_column]
+        for uname, unp in entity.unpivot.items()
     }
 
     cp = checkpoint.get(conn, entity_name, schema=internal_schema)
@@ -380,6 +552,7 @@ def _load_entity_batches(
         main_rows: list[tuple] = []
         explode_rows: dict[str, list[tuple]] = {k: [] for k in explode_columns}
         junction_rows: dict[str, list[tuple]] = {k: [] for k in junction_columns}
+        unpivot_rows: dict[str, list[tuple]] = {k: [] for k in unpivot_columns}
         idmap_entries: list[tuple[str, str, str]] = []
         last_id_in_batch = None
 
@@ -409,26 +582,23 @@ def _load_entity_batches(
             main_rows.append(tuple(row))
 
             for ename, exp in entity.explode.items():
-                for item in doc.get(ename) or []:
-                    erow = [resolved.column_value]
-                    for k, fspec in exp.fields.items():
-                        erow.append(
-                            _resolve_field_value(
-                                item,
-                                k,
-                                fspec,
-                                context=f"{entity_name}.{ename}",
-                                conn=conn,
-                                pg_schema=pg_schema,
-                                target_table=exp.target,
-                                internal_schema=internal_schema,
-                                external_conns=external_conns,
-                            )
-                        )
-                    explode_rows[ename].append(tuple(erow))
+                items = _require_array(doc, ename, context=entity_name)
+                _collect_explode_rows(
+                    resolved.column_value,
+                    items,
+                    exp,
+                    path=ename,
+                    context=entity_name,
+                    conn=conn,
+                    pg_schema=pg_schema,
+                    id_buffers=explode_id_buffers,
+                    explode_rows=explode_rows,
+                    internal_schema=internal_schema,
+                    external_conns=external_conns,
+                )
 
             for jname, junc in entity.junction.items():
-                for child_source in doc.get(jname) or []:
+                for child_source in _require_array(doc, jname, context=entity_name):
                     if junc.child_fk.lookup:
                         child_val = _resolve_lookup(
                             conn,
@@ -444,6 +614,17 @@ def _load_entity_batches(
                         child_val = child_source
                     junction_rows[jname].append((resolved.column_value, child_val))
 
+            for uname, unp in entity.unpivot.items():
+                for item in unp.items:
+                    raw = get_nested(doc, item.source_field)
+                    if raw is None and unp.skip_null:
+                        continue
+                    value = _resolve_unpivot_value(
+                        doc, item, context=f"{entity_name}.{uname}", pg_schema=pg_schema,
+                        target_table=unp.target, value_column=unp.value_column,
+                    )
+                    unpivot_rows[uname].append((resolved.column_value, item.code, value))
+
             idmap_entries.append((entity_name, str(source_id), resolved.str_form))
             last_id_in_batch = source_id
 
@@ -453,9 +634,12 @@ def _load_entity_batches(
             _copy_rows(conn, table, main_columns, main_rows)
 
         # explode children always plain-COPY regardless of mode — see module
-        # docstring: a SERIAL child id has no natural conflict target.
-        for ename, cols in explode_columns.items():
-            _copy_rows(conn, entity.explode[ename].target, cols, explode_rows[ename])
+        # docstring: a SERIAL child id has no natural conflict target. Write
+        # order follows flattened_explode's parent-before-child ordering —
+        # a nested level's rows FK-reference the parent level's just-written
+        # rows within this same uncommitted transaction.
+        for path, exp in flattened_explode:
+            _copy_rows(conn, exp.target, explode_columns[path], explode_rows[path])
 
         for jname, junc in entity.junction.items():
             cols = junction_columns[jname]
@@ -469,6 +653,20 @@ def _load_entity_batches(
                 )
             else:
                 _copy_rows(conn, junc.target, cols, junction_rows[jname])
+
+        for uname, unp in entity.unpivot.items():
+            cols = unpivot_columns[uname]
+            if mode == "upsert":
+                # (parent_fk, code) is a genuine natural key here — unlike explode's
+                # SERIAL children, re-running upsert for the same document sensibly
+                # updates the value for a given code rather than duplicating rows.
+                _upsert_rows(
+                    conn, unp.target, cols, unpivot_rows[uname],
+                    conflict_columns=[unp.parent_fk.target_field, unp.code_column],
+                )
+            else:
+                _copy_rows(conn, unp.target, cols, unpivot_rows[uname])
+
         for e, s, t in idmap_entries:
             idmap.put(conn, e, s, t, schema=internal_schema)
         checkpoint.advance(conn, entity_name, str(last_id_in_batch), len(batch), schema=internal_schema)

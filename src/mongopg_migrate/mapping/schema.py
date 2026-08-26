@@ -117,17 +117,46 @@ class ForeignKeyRef(BaseModel):
 
 
 class ExplodeSpec(BaseModel):
-    """Embedded object/array field -> rows in an existing child table."""
+    """Embedded object/array field -> rows in an existing child table.
+
+    Can itself carry a nested `explode` — a second embedded array one level
+    down (e.g. `hospitalDetails.facilities[].categoryParts[]` -> a
+    `HospitalFacility` row per facility, each with its own `FacilityCategoryPart`
+    child rows). A level with nested children needs its OWN id known *before*
+    its row is COPYed, so that value can be threaded down as the nested
+    level's `parent_fk` — that's the only reason `id_strategy` has to do real
+    work here (a leaf level's PK can still just be `serial`, auto-assigned by
+    Postgres at COPY time, exactly as before nesting existed). `serial` is
+    rejected on a level that has nested children below it, since a SERIAL's
+    actual assigned value isn't known until after INSERT and COPY has no
+    RETURNING to recover it.
+    """
 
     target: str
     id_strategy: IdStrategy
     parent_fk: ForeignKeyRef
     fields: dict[str, FieldSpec] = Field(default_factory=dict)
+    explode: dict[str, ExplodeSpec] = Field(default_factory=dict)
 
     @field_validator("fields", mode="before")
     @classmethod
     def _coerce_fields(cls, v: Any) -> dict[str, Any]:
         return _normalize_field_map(v)
+
+    @model_validator(mode="after")
+    def _serial_id_cannot_have_nested_children(self) -> ExplodeSpec:
+        if self.explode and self.id_strategy.type == IdStrategyType.SERIAL:
+            raise ValueError(
+                "explode level has nested `explode` children but id_strategy.type is 'serial' — "
+                "a SERIAL value isn't known until after INSERT (COPY has no RETURNING), so it can't "
+                "be threaded down to the nested children's parent_fk. Use objectid_to_uuid, "
+                "uuid_generate, int_sequence, or passthrough instead, with a source_field that "
+                "identifies this embedded item (e.g. its own `_id` if Mongo assigned one)."
+            )
+        return self
+
+
+ExplodeSpec.model_rebuild()
 
 
 class JunctionSpec(BaseModel):
@@ -141,6 +170,47 @@ class JunctionSpec(BaseModel):
     target: str
     parent_fk: ForeignKeyRef
     child_fk: ForeignKeyRef
+
+
+class UnpivotItem(BaseModel):
+    """One named source field an `unpivot` spec turns into a row."""
+
+    source_field: str
+    code: str
+    transform: str | None = None
+
+
+class UnpivotSpec(BaseModel):
+    """N named, differently-shaped source fields -> N rows in an existing
+    child table, each carrying a literal `code` identifying which source
+    field it came from — the EAV/pivot-normalization pattern (e.g. a
+    document with `pfAmount`/`finalBill`/`approvedCost` fields landing as
+    three rows in a `booking_amounts` table, each tagged
+    `PF_AMOUNT`/`FINAL_BILL`/`APPROVED_COST`). Distinct from both other
+    multi-row constructs: `explode` takes one embedded *array* and repeats
+    the same shape per item; `junction` takes one array of scalar FKs.
+    Neither can express "several differently-named top-level fields, each
+    becoming its own row" — that's what this is for. `skip_null` (default
+    `True`) omits a row entirely when its source field is absent/null,
+    rather than writing a row with a null `value_column`.
+    """
+
+    target: str
+    parent_fk: ForeignKeyRef
+    code_column: str
+    value_column: str
+    items: list[UnpivotItem]
+    skip_null: bool = True
+
+    @model_validator(mode="after")
+    def _codes_and_source_fields_unique(self) -> UnpivotSpec:
+        codes = [item.code for item in self.items]
+        if len(codes) != len(set(codes)):
+            raise ValueError(f"unpivot codes must be unique within one spec, got: {codes}")
+        sources = [item.source_field for item in self.items]
+        if len(sources) != len(set(sources)):
+            raise ValueError(f"unpivot source_fields must be unique within one spec, got: {sources}")
+        return self
 
 
 class UnmappedPolicy(BaseModel):
@@ -208,6 +278,7 @@ class EntityMapping(BaseModel):
     fields: dict[str, FieldSpec] = Field(default_factory=dict)
     explode: dict[str, ExplodeSpec] = Field(default_factory=dict)
     junction: dict[str, JunctionSpec] = Field(default_factory=dict)
+    unpivot: dict[str, UnpivotSpec] = Field(default_factory=dict)
     unmapped: UnmappedPolicy = Field(default_factory=UnmappedPolicy)
     filter: FilterSpec | None = None
 
@@ -232,12 +303,14 @@ class EntityMapping(BaseModel):
 
     def mapped_source_fields(self) -> set[str]:
         """All top-level source field names this entity gives a disposition
-        to, one way or another (mapped, exploded, junctioned, or explicitly
-        dropped/jsonb'd)."""
+        to, one way or another (mapped, exploded, junctioned, unpivoted, or
+        explicitly dropped/jsonb'd)."""
+        unpivot_fields = {item.source_field for spec in self.unpivot.values() for item in spec.items}
         return (
             set(self.fields.keys())
             | set(self.explode.keys())
             | set(self.junction.keys())
+            | unpivot_fields
             | self.unmapped.dispositioned
             | {"_id"}  # always accounted for via id_strategy
         )

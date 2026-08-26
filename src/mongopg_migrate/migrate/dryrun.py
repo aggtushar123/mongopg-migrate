@@ -51,8 +51,10 @@ from mongopg_migrate.introspect.postgres import PostgresSchema
 from mongopg_migrate.mapping.schema import (
     CircularEntityDependencyError,
     EntityMapping,
+    ExplodeSpec,
     FieldSpec,
     MappingFile,
+    UnpivotSpec,
 )
 from mongopg_migrate.migrate import idmap
 from mongopg_migrate.migrate.load import (
@@ -93,15 +95,25 @@ class DryRunReport:
 # --- Layer A: fast pass -------------------------------------------------------
 
 
+def _flatten_explode(explode: dict[str, ExplodeSpec], *, path_prefix: str = "") -> list[tuple[str, ExplodeSpec]]:
+    # Mirrors migrate/load.py's private helper of the same name (parent-
+    # before-child pre-order) — kept as a separate small copy rather than
+    # importing a leading-underscore name across modules.
+    out: list[tuple[str, ExplodeSpec]] = []
+    for ename, exp in explode.items():
+        path = f"{path_prefix}.{ename}" if path_prefix else ename
+        out.append((path, exp))
+        out.extend(_flatten_explode(exp.explode, path_prefix=path))
+    return out
+
+
 def _mapped_tables(mapping: MappingFile) -> set[str]:
-    # Mirrors migrate/load.py's private helper of the same name — kept as a
-    # separate small copy rather than importing a leading-underscore name
-    # across modules.
     tables: set[str] = set()
     for entity in mapping.entities.values():
         tables.add(entity.target)
-        tables.update(exp.target for exp in entity.explode.values())
+        tables.update(exp.target for _, exp in _flatten_explode(entity.explode))
         tables.update(junc.target for junc in entity.junction.values())
+        tables.update(unp.target for unp in entity.unpivot.values())
     return tables
 
 
@@ -121,16 +133,104 @@ def _merge_needs(into: dict[str, set], other: dict[str, set]) -> None:
         into.setdefault(k, set()).update(v)
 
 
+def _gather_explode_lookup_needs(item: dict, exp: ExplodeSpec) -> dict[str, set]:
+    """Recurses into nested `explode` children so a `lookup:` on a
+    grandchild-level field (e.g. `categoryParts[].departmentId`) is
+    collected too, not just the top explode level's own fields."""
+    needs = _gather_field_lookup_needs(item, exp.fields)
+    for nested_ename, nested_exp in exp.explode.items():
+        for nested_item in _as_array(item.get(nested_ename)):
+            _merge_needs(needs, _gather_explode_lookup_needs(nested_item, nested_exp))
+    return needs
+
+
+def _as_array(value: object) -> list:
+    """Permissive coercion for a field that's *supposed* to be an array —
+    silently returns `[]` for anything else (including a string or dict,
+    both of which are iterable in Python but wrong here — see
+    `_validate_array_shapes`, which is what actually reports this as a
+    violation; this helper just avoids the needs-collection pass from also
+    iterating a string character-by-character while that violation is
+    surfacing elsewhere)."""
+    return value if isinstance(value, list) else []
+
+
+def _validate_explode_array_shapes(item: dict, exp: ExplodeSpec, *, entity_name: str, field_path: str) -> list[DryRunViolation]:
+    """Recurses into nested `explode` children so a scalar-where-array-
+    expected mistake at a grandchild level (e.g. `categoryParts` present
+    but not actually a list) is caught too, not just at the top level."""
+    violations: list[DryRunViolation] = []
+    for nested_ename, nested_exp in exp.explode.items():
+        nested_path = f"{field_path}.{nested_ename}"
+        value = item.get(nested_ename)
+        if value is not None and not isinstance(value, list):
+            violations.append(
+                DryRunViolation(
+                    entity=entity_name,
+                    layer="fast",
+                    field=nested_path,
+                    message=f"explode field {nested_path!r} is not an array (got {type(value).__name__}: "
+                    f"{value!r}) — this would silently iterate wrong at migrate time (a string iterates "
+                    "character-by-character); fix the mapping or the source data",
+                )
+            )
+            continue
+        for nested_item in _as_array(value):
+            violations.extend(
+                _validate_explode_array_shapes(nested_item, nested_exp, entity_name=entity_name, field_path=nested_path)
+            )
+    return violations
+
+
+def _validate_array_shapes(doc: dict, entity: EntityMapping, entity_name: str) -> list[DryRunViolation]:
+    """`explode`/`junction` fields must be a real Mongo array. Catches the
+    same shape problem migrate/load.py's `_require_array` refuses to run
+    on — a scalar string is technically iterable in Python (character by
+    character) but not what either construct means; a scalar reference
+    belongs in `fields:` with `lookup:` instead of `junction:`."""
+    violations: list[DryRunViolation] = []
+    for ename, exp in entity.explode.items():
+        value = doc.get(ename)
+        if value is not None and not isinstance(value, list):
+            violations.append(
+                DryRunViolation(
+                    entity=entity_name,
+                    layer="fast",
+                    field=ename,
+                    message=f"explode field {ename!r} is not an array (got {type(value).__name__}: "
+                    f"{value!r}) — this would silently iterate wrong at migrate time (a string iterates "
+                    "character-by-character); fix the mapping or the source data",
+                )
+            )
+            continue
+        for item in _as_array(value):
+            violations.extend(_validate_explode_array_shapes(item, exp, entity_name=entity_name, field_path=ename))
+    for jname in entity.junction:
+        value = doc.get(jname)
+        if value is not None and not isinstance(value, list):
+            violations.append(
+                DryRunViolation(
+                    entity=entity_name,
+                    layer="fast",
+                    field=jname,
+                    message=f"junction field {jname!r} is not an array (got {type(value).__name__}: "
+                    f"{value!r}) — a single scalar reference belongs in `fields:` with `lookup:` instead "
+                    "of `junction:`",
+                )
+            )
+    return violations
+
+
 def _collect_batch_lookup_needs(batch: list[dict], entity: EntityMapping) -> dict[str, set]:
     needs: dict[str, set] = {}
     for doc in batch:
         _merge_needs(needs, _gather_field_lookup_needs(doc, entity.fields))
         for ename, exp in entity.explode.items():
-            for item in doc.get(ename) or []:
-                _merge_needs(needs, _gather_field_lookup_needs(item, exp.fields))
+            for item in _as_array(doc.get(ename)):
+                _merge_needs(needs, _gather_explode_lookup_needs(item, exp))
         for jname, junc in entity.junction.items():
             if junc.child_fk.lookup:
-                for child_source in doc.get(jname) or []:
+                for child_source in _as_array(doc.get(jname)):
                     if child_source is not None:
                         needs.setdefault(junc.child_fk.lookup, set()).add(child_source)
     return needs
@@ -251,6 +351,74 @@ def _validate_field(
     return violations
 
 
+def _validate_explode_item(
+    item: dict,
+    exp: ExplodeSpec,
+    *,
+    context: str,
+    pg_schema: PostgresSchema,
+    found: dict[str, set[str]],
+) -> list[DryRunViolation]:
+    """Validates one exploded item's own fields via `_validate_field`, then
+    recurses into any nested `explode` children — a grandchild-level
+    lookup miss, transform error, or NOT NULL violation is caught here too,
+    not just at the top explode level."""
+    violations: list[DryRunViolation] = []
+    for key, fspec in exp.fields.items():
+        violations.extend(
+            _validate_field(item, key, fspec, context=context, target_table=exp.target, pg_schema=pg_schema, found=found)
+        )
+    for nested_ename, nested_exp in exp.explode.items():
+        nested_context = f"{context}.{nested_ename}"
+        for nested_item in _as_array(item.get(nested_ename)):
+            violations.extend(
+                _validate_explode_item(nested_item, nested_exp, context=nested_context, pg_schema=pg_schema, found=found)
+            )
+    return violations
+
+
+def _validate_unpivot_items(
+    doc: dict, uname: str, unp: UnpivotSpec, *, context: str, pg_schema: PostgresSchema
+) -> list[DryRunViolation]:
+    violations: list[DryRunViolation] = []
+    for item in unp.items:
+        raw = get_nested(doc, item.source_field)
+        if raw is None and unp.skip_null:
+            continue
+        try:
+            value = apply_transform(item.transform, raw)
+        except TransformError as e:
+            violations.append(
+                DryRunViolation(entity=context, layer="fast", field=f"{uname}.{item.source_field}", message=str(e))
+            )
+            continue
+        value = apply_default(item.transform, value)
+        if value is None:
+            table_schema = pg_schema.tables.get(unp.target)
+            col_info = table_schema.columns.get(unp.value_column) if table_schema else None
+            if col_info is None:
+                violations.append(
+                    DryRunViolation(
+                        entity=context,
+                        layer="fast",
+                        field=f"{uname}.{item.source_field}",
+                        message=f"target column {unp.target}.{unp.value_column} not found in the "
+                        "introspected Postgres schema",
+                    )
+                )
+            elif not col_info.is_nullable:
+                violations.append(
+                    DryRunViolation(
+                        entity=context,
+                        layer="fast",
+                        field=f"{uname}.{item.source_field}",
+                        message=f"null value for NOT NULL column {unp.target}.{unp.value_column} "
+                        f"(source field {item.source_field!r} missing/null and no `default:` transform set)",
+                    )
+                )
+    return violations
+
+
 def _validate_id_strategy(doc: dict, entity: EntityMapping, entity_name: str) -> list[DryRunViolation]:
     from bson.objectid import ObjectId
 
@@ -328,6 +496,7 @@ def run_fast_pass(
 
                 for doc in batch:
                     violations.extend(_validate_id_strategy(doc, entity, entity_name))
+                    violations.extend(_validate_array_shapes(doc, entity, entity_name))
 
                     for key, fspec in entity.fields.items():
                         violations.extend(
@@ -338,19 +507,17 @@ def run_fast_pass(
                         )
 
                     for ename, exp in entity.explode.items():
-                        for item in doc.get(ename) or []:
-                            for key, fspec in exp.fields.items():
-                                violations.extend(
-                                    _validate_field(
-                                        item, key, fspec, context=f"{entity_name}.{ename}",
-                                        target_table=exp.target, pg_schema=pg_schema, found=found,
-                                    )
+                        for item in _as_array(doc.get(ename)):
+                            violations.extend(
+                                _validate_explode_item(
+                                    item, exp, context=f"{entity_name}.{ename}", pg_schema=pg_schema, found=found,
                                 )
+                            )
 
                     for jname, junc in entity.junction.items():
                         if not junc.child_fk.lookup:
                             continue
-                        for child_source in doc.get(jname) or []:
+                        for child_source in _as_array(doc.get(jname)):
                             if child_source is not None and str(child_source) not in found.get(
                                 junc.child_fk.lookup, set()
                             ):
@@ -363,6 +530,11 @@ def run_fast_pass(
                                         f"{child_source!r} not found — this would fail at migrate time",
                                     )
                                 )
+
+                    for uname, unp in entity.unpivot.items():
+                        violations.extend(
+                            _validate_unpivot_items(doc, uname, unp, context=entity_name, pg_schema=pg_schema)
+                        )
             if truncated:
                 break
     finally:
