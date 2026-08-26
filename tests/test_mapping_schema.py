@@ -5,8 +5,10 @@ from pydantic import ValidationError
 
 from mongopg_migrate.mapping.schema import (
     EntityMapping,
+    ExplodeSpec,
     FieldSpec,
     FilterSpec,
+    ForeignKeyRef,
     IdStrategy,
     IdStrategyType,
     MappingFile,
@@ -86,6 +88,44 @@ def test_validate_structure_flags_unknown_lookup_entity():
     )
     issues = validate_structure(mapping)
     assert any("nonexistent_entity" in i.message for i in issues)
+
+
+def test_validate_structure_flags_unknown_lookup_entity_nested_two_levels_deep():
+    # Regression: a typo'd lookup one level deeper than the top explode
+    # level (facilities[].categoryParts[].lookup:) passed validate_structure
+    # with zero issues before this fix — found live, testing directly.
+    mapping = MappingFile(
+        entities={
+            "hospitals": EntityMapping(
+                source="hospitals",
+                target="hospitals",
+                id_strategy=IdStrategy(type=IdStrategyType.OBJECTID_TO_UUID, source_field="_id"),
+                explode={
+                    "facilities": ExplodeSpec(
+                        target="hospital_facilities",
+                        id_strategy=IdStrategy(type=IdStrategyType.OBJECTID_TO_UUID, source_field="facilityId"),
+                        parent_fk=ForeignKeyRef(target_field="hospital_id", references="hospitals.id"),
+                        explode={
+                            "categoryParts": ExplodeSpec(
+                                target="facility_category_parts",
+                                id_strategy=IdStrategy(type=IdStrategyType.SERIAL),
+                                parent_fk=ForeignKeyRef(
+                                    target_field="facility_id", references="hospital_facilities.id"
+                                ),
+                                fields={
+                                    "categoryId": FieldSpec(target="category_id", lookup="zcategoriezz_TYPO")
+                                },
+                            )
+                        },
+                    )
+                },
+            )
+        }
+    )
+    issues = validate_structure(mapping)
+    assert len(issues) == 1
+    assert issues[0].field == "facilities.categoryParts.categoryId"
+    assert "zcategoriezz_TYPO" in issues[0].message
 
 
 def test_unmapped_field_policy_catches_a_field_with_no_disposition():

@@ -95,3 +95,19 @@ def is_loaded(
     """Used by resume logic (PRD §7 checkpoint/resume) to skip documents
     already recorded in a prior, interrupted run."""
     return get(conn, entity, source_id, schema=schema) is not None
+
+
+def has_any(conn: psycopg.Connection, entity: str, *, schema: str = DEFAULT_SCHEMA_NAME) -> bool:
+    """Whether *any* id_map row exists for this entity at all — distinct
+    from `get()` missing one specific source_id. Used by migrate/load.py to
+    tell "this individual reference is dangling" apart from "the entity
+    this looks up hasn't loaded a single row yet" (near-certainly a load-
+    order bug, or a referenced external run that never happened) before
+    applying an `on_missing` policy — a policy for dangling references is
+    not a correct answer to "wrong order", and silently absorbing that
+    distinction would turn a loud ordering bug into a quiet all-NULL
+    column. `entity` is the leading column of the primary key, so this is
+    an indexed lookup, not a table scan."""
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT 1 FROM {_qualified(schema)} WHERE entity = %s LIMIT 1", (entity,))
+        return cur.fetchone() is not None

@@ -222,6 +222,7 @@ def _collect_explode_rows(
     internal_schema: str,
     external_conns: dict[str, psycopg.Connection] | None,
     stats: OnMissingStats | None = None,
+    unloaded_entity_cache: dict[str, bool] | None = None,
 ) -> None:
     """Builds this level's rows for one parent document's array, recursing
     into any nested `explode` children. Only a level WITH nested children
@@ -273,6 +274,7 @@ def _collect_explode_rows(
                         internal_schema=internal_schema,
                         external_conns=external_conns,
                         stats=stats,
+                        unloaded_entity_cache=unloaded_entity_cache,
                     )
                 )
             if exp.unmapped.jsonb:
@@ -295,6 +297,7 @@ def _collect_explode_rows(
                 id_buffers=id_buffers,
                 explode_rows=explode_rows,
                 stats=stats,
+                unloaded_entity_cache=unloaded_entity_cache,
                 internal_schema=internal_schema,
                 external_conns=external_conns,
             )
@@ -313,6 +316,7 @@ def _resolve_lookup(
     on_missing: OnMissing = OnMissing.ERROR,
     stats: OnMissingStats | None = None,
     stats_key: str | None = None,
+    unloaded_entity_cache: dict[str, bool] | None = None,
 ):
     if source_value is None:
         return None
@@ -337,6 +341,39 @@ def _resolve_lookup(
         # id_map resolves it (e.g. the referenced document was deleted).
         # Distinct from source_value being absent/null in the first place,
         # which returned None above and was never this tool's problem.
+        #
+        # But before trusting that story: an on_missing policy answers "is
+        # this one reference OK to be missing", not "did the entity it
+        # points at ever actually load". If lookup_entity's id_map is
+        # completely empty right now, this miss is far more likely a load-
+        # order bug (entity_dependencies() failed to see this lookup, e.g.
+        # nested one level deeper than `entity_load_order()` scheduled for
+        # — found live) or a forgotten prerequisite run (an
+        # `external_entities` reference to a migration that was never
+        # actually executed) than a genuinely dangling individual
+        # reference. Applying on_missing here would silently turn "wrong
+        # order" into an all-NULL/all-skipped column that passes
+        # validation cleanly — cached per lookup_entity so this is one
+        # extra indexed query on the *first* miss for that entity, not one
+        # per miss.
+        if on_missing != OnMissing.ERROR:
+            if unloaded_entity_cache is not None and lookup_entity in unloaded_entity_cache:
+                entity_has_no_rows = unloaded_entity_cache[lookup_entity]
+            else:
+                entity_has_no_rows = not idmap.has_any(lookup_conn, lookup_entity, schema=lookup_schema)
+                if unloaded_entity_cache is not None:
+                    unloaded_entity_cache[lookup_entity] = entity_has_no_rows
+            if entity_has_no_rows:
+                raise LoadError(
+                    f"lookup miss: no {lookup_schema}.id_map row for entity={lookup_entity!r} "
+                    f"source_id={source_id_str!r} (needed for {target_table}.{target_column}) — AND "
+                    f"{lookup_entity!r} has NO id_map rows at all yet, so this looks like a load-order "
+                    "problem (was it loaded first? see MappingFile.entity_load_order()) or a forgotten "
+                    "prerequisite run, not a genuinely dangling reference. Refusing to apply "
+                    f"on_missing={on_missing.value!r} here — that policy answers 'is this one reference "
+                    "OK to be missing', not 'did the referenced entity ever load'; applying it would "
+                    "silently turn a wrong load order into an all-NULL/all-skipped column."
+                )
         key = stats_key or f"{lookup_entity}<-{target_table}.{target_column}"
         if on_missing == OnMissing.NULL:
             if stats is not None:
@@ -368,6 +405,7 @@ def _resolve_field_value(
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
     external_conns: dict[str, psycopg.Connection] | None = None,
     stats: OnMissingStats | None = None,
+    unloaded_entity_cache: dict[str, bool] | None = None,
 ):
     raw = get_nested(doc, key)
     if fspec.lookup:
@@ -383,6 +421,7 @@ def _resolve_field_value(
             on_missing=fspec.on_missing,
             stats=stats,
             stats_key=f"{context}.{key}",
+            unloaded_entity_cache=unloaded_entity_cache,
         )
     else:
         value = apply_transform(fspec.transform, raw)
@@ -564,6 +603,10 @@ def _load_entity_batches(
     # EntityLoadResult.rows_skipped/nulled_lookups/skipped_lookups.
     stats = OnMissingStats()
     rows_skipped = 0
+    # Persists across every batch too — caches, per referenced entity name,
+    # whether its id_map has any rows at all yet. Checked (and cached) only
+    # the first time a lookup to that entity misses; see _resolve_lookup.
+    unloaded_entity_cache: dict[str, bool] = {}
 
     table = entity.target
     id_col = entity.id_strategy.target_field
@@ -680,6 +723,7 @@ def _load_entity_batches(
                             internal_schema=internal_schema,
                             external_conns=external_conns,
                             stats=stats,
+                            unloaded_entity_cache=unloaded_entity_cache,
                         )
                     )
                 if jsonb_fields:
@@ -702,6 +746,7 @@ def _load_entity_batches(
                         internal_schema=internal_schema,
                         external_conns=external_conns,
                         stats=stats,
+                        unloaded_entity_cache=unloaded_entity_cache,
                     )
 
                 doc_junction_rows: dict[str, list[tuple]] = {k: [] for k in junction_columns}
@@ -726,6 +771,7 @@ def _load_entity_batches(
                                     on_missing=junc.on_missing,
                                     stats=stats,
                                     stats_key=f"{entity_name}.{jname}",
+                                    unloaded_entity_cache=unloaded_entity_cache,
                                 )
                             except SkipRowError:
                                 continue

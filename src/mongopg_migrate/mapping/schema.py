@@ -287,6 +287,27 @@ class ExplodeSpec(BaseModel):
 ExplodeSpec.model_rebuild()
 
 
+def _explode_lookup_targets(explode: dict[str, ExplodeSpec]) -> set[str]:
+    """Every entity name any `lookup:` reaches, at any nesting depth of
+    `explode` — not just its immediate `.fields`. Found live: a lookup one
+    level deeper than the top (`facilities[].categoryParts[].lookup:
+    zcategories`) was invisible to both `EntityMapping.entity_dependencies()`
+    and `validate_structure()`, which only ever iterated the first explode
+    level's own `.fields`. Two real consequences of that gap, not one: a
+    load-order bug (the referencing entity could be scheduled before the
+    entity it looks up, emptying that lookup's id_map for the whole batch)
+    invisible to `entity_load_order()`, and a typo'd nested `lookup:` name
+    passing `validate_structure()` with zero issues instead of the loud
+    error a top-level typo already gets."""
+    targets: set[str] = set()
+    for exp in explode.values():
+        for fspec in exp.fields.values():
+            if fspec.lookup:
+                targets.add(fspec.lookup)
+        targets |= _explode_lookup_targets(exp.explode)
+    return targets
+
+
 class JunctionSpec(BaseModel):
     """Scalar-ID array field -> rows in an existing many-to-many join table.
 
@@ -495,10 +516,7 @@ class MappingFile(BaseModel):
             for fspec in entity.fields.values():
                 if fspec.lookup:
                     deps[name].add(fspec.lookup)
-            for exp in entity.explode.values():
-                for fspec in exp.fields.values():
-                    if fspec.lookup:
-                        deps[name].add(fspec.lookup)
+            deps[name] |= _explode_lookup_targets(entity.explode)
             for junc in entity.junction.values():
                 if junc.child_fk.lookup:
                     deps[name].add(junc.child_fk.lookup)
@@ -610,12 +628,17 @@ def validate_structure(mapping: MappingFile) -> list[ValidationIssue]:
             )
         )
 
+    def _check_explode_lookups(name: str, path: str, explode: dict[str, ExplodeSpec]) -> None:
+        for ename, exp in explode.items():
+            full_path = f"{path}.{ename}" if path else ename
+            for fname, fspec in exp.fields.items():
+                _check_lookup(name, f"{full_path}.{fname}", fspec.lookup)
+            _check_explode_lookups(name, full_path, exp.explode)
+
     for name, entity in mapping.entities.items():
         for fname, fspec in entity.fields.items():
             _check_lookup(name, fname, fspec.lookup)
-        for ename, exp in entity.explode.items():
-            for fname, fspec in exp.fields.items():
-                _check_lookup(name, f"{ename}.{fname}", fspec.lookup)
+        _check_explode_lookups(name, "", entity.explode)
         for jname, junc in entity.junction.items():
             _check_lookup(name, jname, junc.child_fk.lookup)
     return issues
