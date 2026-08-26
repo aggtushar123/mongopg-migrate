@@ -27,8 +27,8 @@ Early, pre-alpha. Implemented so far:
 | Batch loader: entity-ordered COPY, `_mongopg.id_map`, per-batch checkpoint/resume, `truncate`/`append` | ✅ — live-tested including a real SIGKILL mid-run + resume (4002 docs, zero dupes/orphans) |
 | Dry-run: Layer A (in-memory type/null/lookup checks) + Layer B (real COPY+FK load into a disposable schema clone) | ✅ — live-tested: catches a real lookup miss before any write, leaves zero artifacts on success or failure |
 | Post-migration validation: count diff (incl. explode/junction tables) + hashed-field sample diff | ✅ — live-tested: catches a real corrupted value with the exact field + row identified, clean data passes |
+| `--mode upsert`: staging table + `ON CONFLICT DO UPDATE` for the main entity and `junction` tables; `explode` children always plain-insert (no natural conflict key) | ✅ |
 | CLI: `introspect`, `propose`, `validate-mapping`, `migrate`, `dry-run`, `validate` | ✅ |
-| `--mode upsert` | 🚧 P1 per PRD §7 — `truncate`/`append` are P0 and implemented |
 
 ## Try it
 

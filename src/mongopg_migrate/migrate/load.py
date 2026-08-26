@@ -17,10 +17,23 @@ mid-run resumes from the last committed checkpoint (`find({"_id": {"$gt":
 last_source_id}})`, since Mongo ObjectIds sort by creation time) without
 re-loading anything already committed.
 
-`--mode truncate|append` is P0 (PRD §7); `upsert` is P1 and not handled
-here. The CLI's `--mode` flag has no default (PRD §6 step 6: truncate must
+`--mode truncate|append|upsert` (PRD §7 — `truncate`/`append` P0, `upsert`
+P1). The CLI's `--mode` flag has no default (PRD §6 step 6: truncate must
 never be silently assumed on a non-empty target) — this module trusts that
 an explicit choice already reached it.
+
+`upsert` (PRD §7: "COPY into a staging table, then INSERT ... ON CONFLICT
+(pk) DO UPDATE") applies to the main entity table and to `junction` tables,
+both of which have a natural conflict target (the entity's own PK; the
+junction's two FK columns, which must have a matching unique constraint —
+Postgres errors loudly if not, which is correct: that's a real schema gap,
+not something to paper over). `explode` child tables always plain-COPY
+regardless of mode: their PK is a synthetic `SERIAL` with no natural key
+derivable from the source document to conflict on, so there is nothing
+honest to upsert against — re-running `upsert` re-inserts new child rows
+exactly like `append` would (checkpoint/resume already prevents this from
+duplicating within one logical run; a deliberate second run over the same
+already-loaded documents is a `truncate` situation, not an `upsert` one).
 """
 
 from __future__ import annotations
@@ -40,7 +53,7 @@ from mongopg_migrate.migrate.idstrategy import resolve_new_id
 from mongopg_migrate.migrate.transform import apply_default, apply_transform, get_nested
 
 DEFAULT_BATCH_SIZE = 500
-SUPPORTED_MODES = ("truncate", "append")
+SUPPORTED_MODES = ("truncate", "append", "upsert")
 
 
 class LoadError(Exception):
@@ -136,6 +149,40 @@ def _copy_rows(conn: psycopg.Connection, table: str, columns: list[str], rows: l
             copy.write_row(row)
 
 
+def _upsert_rows(
+    conn: psycopg.Connection, table: str, columns: list[str], rows: list[tuple], conflict_columns: list[str]
+) -> None:
+    """PRD §7 `upsert`: COPY into a per-connection TEMP staging table, then
+    `INSERT ... SELECT ... ON CONFLICT (conflict_columns) DO UPDATE` the
+    non-key columns (or `DO NOTHING` if there are none — the junction-table
+    case, where the two FK columns are the entire row). The staging table
+    is a real TEMP table (session-scoped, auto-dropped at connection close)
+    so this gets COPY's bulk-load performance instead of row-by-row INSERT,
+    while still getting ON CONFLICT semantics that COPY itself can't do.
+    """
+    if not rows:
+        return
+    staging = f"__mongopg_stage_{table}"
+    col_list = ", ".join(f'"{c}"' for c in columns)
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE TEMP TABLE IF NOT EXISTS "{staging}" (LIKE "{table}" INCLUDING DEFAULTS)')
+        cur.execute(f'TRUNCATE "{staging}"')
+    with conn.cursor() as cur, cur.copy(f'COPY "{staging}" ({col_list}) FROM STDIN') as copy:
+        for row in rows:
+            copy.write_row(row)
+
+    conflict_list = ", ".join(f'"{c}"' for c in conflict_columns)
+    update_cols = [c for c in columns if c not in conflict_columns]
+    conflict_action = (
+        "UPDATE SET " + ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols) if update_cols else "NOTHING"
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            f'INSERT INTO "{table}" ({col_list}) SELECT {col_list} FROM "{staging}" '
+            f"ON CONFLICT ({conflict_list}) DO {conflict_action}"
+        )
+
+
 def _mapped_tables(mapping: MappingFile) -> set[str]:
     tables: set[str] = set()
     for entity in mapping.entities.values():
@@ -170,6 +217,7 @@ def _load_entity_batches(
     pg_schema: PostgresSchema,
     batch_size: int,
     *,
+    mode: str = "append",
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
 ) -> EntityLoadResult:
     # Local import: keeps bson out of modules that don't need Mongo types.
@@ -282,11 +330,28 @@ def _load_entity_batches(
             idmap_entries.append((entity_name, str(source_id), resolved.str_form))
             last_id_in_batch = source_id
 
-        _copy_rows(conn, table, main_columns, main_rows)
+        if mode == "upsert":
+            _upsert_rows(conn, table, main_columns, main_rows, conflict_columns=[id_col])
+        else:
+            _copy_rows(conn, table, main_columns, main_rows)
+
+        # explode children always plain-COPY regardless of mode — see module
+        # docstring: a SERIAL child id has no natural conflict target.
         for ename, cols in explode_columns.items():
             _copy_rows(conn, entity.explode[ename].target, cols, explode_rows[ename])
-        for jname, cols in junction_columns.items():
-            _copy_rows(conn, entity.junction[jname].target, cols, junction_rows[jname])
+
+        for jname, junc in entity.junction.items():
+            cols = junction_columns[jname]
+            if mode == "upsert":
+                _upsert_rows(
+                    conn,
+                    junc.target,
+                    cols,
+                    junction_rows[jname],
+                    conflict_columns=[junc.parent_fk.target_field, junc.child_fk.target_field],
+                )
+            else:
+                _copy_rows(conn, junc.target, cols, junction_rows[jname])
         for e, s, t in idmap_entries:
             idmap.put(conn, e, s, t, schema=internal_schema)
         checkpoint.advance(conn, entity_name, str(last_id_in_batch), len(batch), schema=internal_schema)
@@ -319,10 +384,7 @@ def load(
     callers should leave both at their defaults.
     """
     if mode not in SUPPORTED_MODES:
-        raise ValueError(
-            f"mode={mode!r} not supported — `upsert` is P1 (PRD §7), not yet implemented; "
-            f"use one of {SUPPORTED_MODES}"
-        )
+        raise ValueError(f"mode={mode!r} not supported — use one of {SUPPORTED_MODES}")
 
     order = mapping.entity_load_order()  # raises CircularEntityDependencyError
 
@@ -357,6 +419,7 @@ def load(
                     entity,
                     pg_schema,
                     batch_size,
+                    mode=mode,
                     internal_schema=internal_schema,
                 )
                 summary.results.append(result)

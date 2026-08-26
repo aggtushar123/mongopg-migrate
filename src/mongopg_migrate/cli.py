@@ -17,6 +17,7 @@ import json
 import sys
 
 import click
+import psycopg
 
 from mongopg_migrate.introspect.mongo import introspect_database
 from mongopg_migrate.introspect.postgres import CircularDependencyError, introspect_postgres
@@ -254,9 +255,11 @@ def dry_run_cmd(
 @POSTGRES_URI_OPTION
 @click.option(
     "--mode",
-    type=click.Choice(["truncate", "append"]),
+    type=click.Choice(["truncate", "append", "upsert"]),
     required=True,
-    help="No default — an explicit choice is required (PRD §6 step 6: truncate must never be silently assumed).",
+    help="No default — an explicit choice is required (PRD §6 step 6: truncate must never be silently assumed). "
+    "upsert requires a unique constraint on each junction table's two FK columns; explode child tables "
+    "(SERIAL keys, no natural conflict target) always insert regardless of mode.",
 )
 @click.option("--pg-schema", default="public")
 @click.option("--batch-size", type=int, default=500)
@@ -275,6 +278,18 @@ def migrate_cmd(
         click.echo("\nFix the mapping file (see `validate-mapping`) before running migrate.", err=True)
         sys.exit(1)
 
+    if mode == "upsert":
+        exploding_entities = [name for name, e in mapping.entities.items() if e.explode]
+        if exploding_entities:
+            click.echo(
+                f"NOTE: --mode upsert re-inserts (does not deduplicate) rows in explode child "
+                f"tables for: {', '.join(exploding_entities)} — their child tables have a SERIAL "
+                "key with no natural conflict target. Re-running upsert over already-loaded "
+                "documents will duplicate those child rows. Use --mode truncate for a clean "
+                "re-migration instead if that matters here.",
+                err=True,
+            )
+
     click.echo("Introspecting PostgreSQL (for FK graph, column types, and truncate order)...", err=True)
     pg = introspect_postgres(postgres_uri, schema=pg_schema)
 
@@ -292,6 +307,26 @@ def migrate_cmd(
             "\nThe transaction for the in-progress batch was rolled back; already-committed "
             "batches are unaffected. Fix the issue and re-run — it will resume from the last "
             "checkpoint (see _mongopg.load_checkpoint).",
+            err=True,
+        )
+        sys.exit(1)
+    except psycopg.errors.UniqueViolation as e:
+        click.echo(f"ERROR: {e}", err=True)
+        click.echo(
+            "\nThat's a primary-key conflict, not a data-quality problem: some rows for this "
+            "entity already exist in the target. `--mode append` requires the target to hold "
+            "only new rows — re-run with `--mode upsert` if you want to update existing rows "
+            "for a re-migrated/changed source document, or `--mode truncate` to start over. "
+            "The in-progress batch's transaction was rolled back; already-committed batches "
+            "are unaffected.",
+            err=True,
+        )
+        sys.exit(1)
+    except psycopg.Error as e:
+        click.echo(f"ERROR: Postgres error: {e}", err=True)
+        click.echo(
+            "\nThe transaction for the in-progress batch was rolled back; already-committed "
+            "batches are unaffected.",
             err=True,
         )
         sys.exit(1)
