@@ -75,13 +75,13 @@ Teams migrating from MongoDB to a normalized PostgreSQL schema face a specific, 
   - `report/validate.py` — post-migration count/diff report **plus** hashed-field sample diff to catch value-level mismatches that counts alone would miss
 - **LLM integration**: pluggable, off by default; when enabled, only schema metadata (field names/types/sample shapes) is sent — never actual row data — to minimize privacy exposure. Configurable to use local models to keep it fully offline-capable.
 - **Distribution**:
-  - **Primary: Docker image** — the recommended way for most users to run the tool. Avoids Python version/driver setup, works identically across OSes, and gives a clean, disposable execution boundary for a task that writes to production Postgres. Connection strings and mapping file passed via env vars / volume mount, e.g.:
+  - **Primary: Docker image** — the recommended way for most users to run the tool. Avoids Python version/driver setup, works identically across OSes, and gives a clean, disposable execution boundary for a task that writes to production Postgres. Connection strings and mapping file passed via env vars / volume mount, e.g. (verified working against the fixture in `docker-compose.yml`, `docker/Dockerfile`):
     ```
-    docker run --rm \
-      -e MONGO_URI=... \
-      -e POSTGRES_URI=... \
-      -v $(pwd)/mapping.yaml:/app/mapping.yaml \
-      mongopg-migrate:latest migrate --mapping /app/mapping.yaml
+    docker run --rm --network <mongo-and-postgres-network> \
+      -e MONGO_URI=mongodb://mongo:27017/app \
+      -e POSTGRES_URI=postgresql://postgres:postgres@postgres:5432/app \
+      -v $(pwd)/mapping.yaml:/app/mapping.yaml:ro \
+      mongopg-migrate:latest migrate /app/mapping.yaml --mode truncate
     ```
   - **Secondary: pip package** (`pip install mongopg-migrate`) — for users who want it as an importable library or already have a Python environment set up.
   - **npm package**: deferred. Would require either a Node/TS rewrite of the core or a wrapper around the Python tool, neither of which is worth the maintenance cost without clear demand from JS-only teams. Revisit only if requested post-launch.

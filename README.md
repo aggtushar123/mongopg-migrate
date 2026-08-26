@@ -29,6 +29,7 @@ Early, pre-alpha. Implemented so far:
 | Post-migration validation: count diff (incl. explode/junction tables) + hashed-field sample diff | ✅ — live-tested: catches a real corrupted value with the exact field + row identified, clean data passes |
 | `--mode upsert`: staging table + `ON CONFLICT DO UPDATE` for the main entity and `junction` tables; `explode` children always plain-insert (no natural conflict key) | ✅ |
 | CLI: `introspect`, `propose`, `validate-mapping`, `migrate`, `dry-run`, `validate` | ✅ |
+| Docker image (primary distribution, PRD §8) | ✅ — live-tested: builds clean, every command run from inside the container against the fixture over the compose network |
 
 ## Try it
 
@@ -66,6 +67,29 @@ mongopg-migrate validate fixtures/mapping.example.yaml \
 the seeded fixture data (orders → orders/order_items/order_tags) matching
 the PRD §12 example — a reference for what `propose` should get most of the
 way to on its own.
+
+### Docker (primary distribution, per PRD §8)
+
+```bash
+docker compose up -d                                          # local Mongo + Postgres fixture
+docker build -f docker/Dockerfile -t mongopg-migrate:latest .  # the tool itself
+
+docker run --rm --network mongodbtopostgres_default \
+  -e MONGO_URI=mongodb://mongo:27017/app \
+  -e POSTGRES_URI=postgresql://postgres:postgres@postgres:5432/app \
+  -v "$(pwd)/fixtures/mapping.example.yaml:/app/mapping.yaml:ro" \
+  mongopg-migrate:latest migrate /app/mapping.yaml --mode truncate
+```
+
+Note the internal Postgres port (`5432`, not the `55432` host-mapped port
+from the local `.venv` examples above) and `--network`, pointing the tool's
+container at the compose network so `mongo`/`postgres` resolve as hostnames
+— both are only relevant when the tool itself runs in a container talking
+to other containers; a tool container reaching an external/host database
+just uses that database's real connection string, no `--network` needed.
+Every command (`introspect`, `propose`, `validate-mapping`, `dry-run`,
+`migrate`, `validate`) has been run this way against the fixture above; the
+Dockerfile builds successfully on a clean checkout.
 
 ## Development
 
