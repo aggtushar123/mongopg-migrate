@@ -392,11 +392,13 @@ def propose_entity(
         if issue:
             issues.append(issue)
 
+    jsonb_columns = sorted(c.name for c in table.columns.values() if "json" in c.data_type.lower())
+    jsonb_column = jsonb_columns[0] if jsonb_columns else None
+
     unmapped = UnmappedPolicy()
-    has_jsonb_col = any("json" in c.data_type.lower() for c in table.columns.values())
     still_unmapped = collection.top_level_field_names() - handled
     for f in sorted(still_unmapped):
-        target_list = unmapped.jsonb if has_jsonb_col else unmapped.drop
+        target_list = unmapped.jsonb if jsonb_column else unmapped.drop
         target_list.append(f)
         if f not in flagged:
             issues.append(
@@ -404,8 +406,20 @@ def propose_entity(
                     entity=collection.name,
                     field=f,
                     message="no confident mapping found — flagged as "
-                    + ("jsonb fallback" if has_jsonb_col else "drop")
+                    + (f"jsonb fallback into {jsonb_column!r}" if jsonb_column else "drop")
                     + "; review required before confirming",
+                )
+            )
+    if unmapped.jsonb:
+        unmapped.jsonb_column = jsonb_column
+        if len(jsonb_columns) > 1:
+            issues.append(
+                ProposalIssue(
+                    entity=collection.name,
+                    field=None,
+                    message=f"target table {table_name!r} has multiple jsonb-ish columns "
+                    f"{jsonb_columns} — defaulted unmapped.jsonb_column to {jsonb_column!r}; "
+                    "change it if that's the wrong one",
                 )
             )
 

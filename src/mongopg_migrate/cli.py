@@ -304,12 +304,16 @@ def dry_run_cmd(
             )
         elif realistic:
             click.echo("Running Layer A (fast pass)...", err=True)
-            report = dryrun.run_fast_pass(mapping, mongo_uri, pg, batch_size=batch_size, sample_size=sample_size)
+            report = dryrun.run_fast_pass(
+                mapping, mongo_uri, pg, postgres_dsn=postgres_uri, batch_size=batch_size, sample_size=sample_size
+            )
             click.echo("Running Layer B (realistic pass, disposable schema clone)...", err=True)
             realistic_report = dryrun.run_realistic_pass(mapping, mongo_uri, postgres_uri, pg, batch_size=batch_size)
             report.violations.extend(realistic_report.violations)
         else:
-            report = dryrun.run_fast_pass(mapping, mongo_uri, pg, batch_size=batch_size, sample_size=sample_size)
+            report = dryrun.run_fast_pass(
+                mapping, mongo_uri, pg, postgres_dsn=postgres_uri, batch_size=batch_size, sample_size=sample_size
+            )
     except CircularEntityDependencyError as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)

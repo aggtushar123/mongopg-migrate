@@ -34,15 +34,38 @@ honest to upsert against — re-running `upsert` re-inserts new child rows
 exactly like `append` would (checkpoint/resume already prevents this from
 duplicating within one logical run; a deliberate second run over the same
 already-loaded documents is a `truncate` situation, not an `upsert` one).
+
+`entity.unmapped.jsonb` is a real landing, not a label: every field listed
+there is serialized into one JSON object and written to
+`entity.unmapped.jsonb_column` alongside the mapped fields — see
+`_build_jsonb_payload`. (`mapping/schema.py`'s `UnmappedPolicy` validator
+already refuses a mapping where `jsonb` is non-empty but `jsonb_column`
+isn't set, so this module never has to guess a destination.)
+
+`entity.filter` (PRD §7 P0 "multiple mappings filtered by discriminator")
+restricts the Mongo query to one discriminator value — see
+`EntityMapping.mongo_filter()`. Merged with the resume cursor's `$gt`
+clause; both are plain top-level query keys, so a dict union is enough,
+no `$and` needed.
+
+An entity already marked `done` is still re-queried past its checkpointed
+`last_source_id` (not skipped outright) — otherwise `append`/`upsert`
+would only ever see whatever existed the first time an entity finished,
+and picking up documents inserted since would require manually deleting
+the checkpoint row. `already_done=True` on the result now means "queried,
+found nothing new" rather than "didn't even look".
 """
 
 from __future__ import annotations
 
+import datetime
+import decimal
 import itertools
 import uuid
 from dataclasses import dataclass, field
 
 import psycopg
+from psycopg.types.json import Jsonb
 from pymongo import MongoClient
 from pymongo.database import Database
 
@@ -140,6 +163,33 @@ def _resolve_field_value(
     return value
 
 
+def _json_safe(value: object) -> object:
+    """Recursively converts a raw Mongo value into something `json`-native
+    (and hence safe inside a `Jsonb(...)` payload): BSON types with no
+    direct JSON equivalent (ObjectId, Decimal128, bytes, ...) fall back to
+    `str()`; dict/list recurse; everything already JSON-native passes
+    through unchanged."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, datetime.datetime):
+        # pymongo returns naive datetimes (implicitly UTC — Mongo has no other
+        # concept of a stored timezone); stamp that explicitly so the JSON
+        # value isn't ambiguous to whatever reads it later.
+        aware = value if value.tzinfo else value.replace(tzinfo=datetime.UTC)
+        return aware.isoformat()
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    return str(value)
+
+
+def _build_jsonb_payload(doc: dict, jsonb_fields: list[str]) -> Jsonb:
+    return Jsonb({f: _json_safe(get_nested(doc, f)) for f in jsonb_fields})
+
+
 def _copy_rows(conn: psycopg.Connection, table: str, columns: list[str], rows: list[tuple]) -> None:
     if not rows:
         return
@@ -234,6 +284,16 @@ def _load_entity_batches(
     field_keys = list(entity.fields.keys())
     main_columns = [id_col] + [entity.fields[k].target for k in field_keys]
 
+    jsonb_fields = sorted(entity.unmapped.jsonb)
+    if jsonb_fields:
+        jsonb_column = entity.unmapped.jsonb_column  # required by UnmappedPolicy validation whenever jsonb is non-empty
+        if table_schema is None or jsonb_column not in table_schema.columns:
+            raise LoadError(
+                f"{entity_name}: unmapped.jsonb_column {jsonb_column!r} is not a column on "
+                f"{table!r} — fix the mapping file before running migrate"
+            )
+        main_columns = main_columns + [jsonb_column]
+
     explode_columns = {
         ename: [exp.parent_fk.target_field] + [exp.fields[k].target for k in exp.fields]
         for ename, exp in entity.explode.items()
@@ -244,18 +304,17 @@ def _load_entity_batches(
     }
 
     cp = checkpoint.get(conn, entity_name, schema=internal_schema)
-    if cp is not None and cp.status == "done":
-        return EntityLoadResult(entity=entity_name, rows_loaded=0, resumed_from=None, already_done=True)
-
+    was_previously_done = cp is not None and cp.status == "done"
     resume_from = cp.last_source_id if cp else None
-    query: dict = {}
+
+    query: dict = dict(entity.mongo_filter())
     if resume_from:
         try:
-            query = {"_id": {"$gt": ObjectId(resume_from)}}
+            query["_id"] = {"$gt": ObjectId(resume_from)}
         except InvalidId:
             # id_strategy isn't objectid-based (e.g. source _id is a plain string) —
             # compare on the raw checkpointed value instead.
-            query = {"_id": {"$gt": resume_from}}
+            query["_id"] = {"$gt": resume_from}
 
     cursor = coll.find(query).sort("_id", 1)
     total_rows = 0
@@ -291,6 +350,8 @@ def _load_entity_batches(
                         internal_schema=internal_schema,
                     )
                 )
+            if jsonb_fields:
+                row.append(_build_jsonb_payload(doc, jsonb_fields))
             main_rows.append(tuple(row))
 
             for ename, exp in entity.explode.items():
@@ -361,7 +422,12 @@ def _load_entity_batches(
 
     checkpoint.mark_done(conn, entity_name, schema=internal_schema)
     conn.commit()
-    return EntityLoadResult(entity=entity_name, rows_loaded=total_rows, resumed_from=resume_from)
+    return EntityLoadResult(
+        entity=entity_name,
+        rows_loaded=total_rows,
+        resumed_from=resume_from,
+        already_done=(was_previously_done and total_rows == 0),
+    )
 
 
 def load(

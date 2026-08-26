@@ -54,6 +54,7 @@ from mongopg_migrate.mapping.schema import (
     FieldSpec,
     MappingFile,
 )
+from mongopg_migrate.migrate import idmap
 from mongopg_migrate.migrate.load import LoadError
 from mongopg_migrate.migrate.load import load as run_batch_load
 from mongopg_migrate.migrate.transform import (
@@ -131,17 +132,42 @@ def _collect_batch_lookup_needs(batch: list[dict], entity: EntityMapping) -> dic
     return needs
 
 
-def _check_existence(db: Database, mapping: MappingFile, needs: dict[str, set]) -> dict[str, set[str]]:
+def _check_existence(
+    db: Database,
+    mapping: MappingFile,
+    needs: dict[str, set],
+    *,
+    conn: psycopg.Connection | None = None,
+    internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
+) -> dict[str, set[str]]:
     """One batched `$in` existence query per referenced entity, against
-    Mongo directly — see module docstring for why not against id_map."""
+    Mongo directly (see module docstring for why not against id_map, in
+    general). The one exception is a `lookup:` naming a declared
+    `external_entities` entry (PRD §12's cross-run case: `users` was
+    migrated in an earlier run, this mapping only covers `orders`) — there
+    is no local Mongo-side collection mapping to check against locally in
+    the way a declared entity has, so those are checked against the real
+    `_mongopg.id_map` instead, when a connection is available. Without one,
+    external lookups are left unverified here — dry-run's Layer A doesn't
+    hard-require Postgres access, so this degrades gracefully rather than
+    failing; `validate_structure` already ensures every non-external
+    `lookup:` target is a real, declared entity before dry-run even runs.
+    """
     found: dict[str, set[str]] = {}
     for lookup_entity, raw_values in needs.items():
-        target_entity = mapping.entities.get(lookup_entity)
-        if target_entity is None or not raw_values:
+        if not raw_values:
             continue
-        coll = db[target_entity.source]
-        docs = coll.find({"_id": {"$in": list(raw_values)}}, {"_id": 1})
-        found[lookup_entity] = {str(d["_id"]) for d in docs}
+        target_entity = mapping.entities.get(lookup_entity)
+        if target_entity is not None:
+            coll = db[target_entity.source]
+            docs = coll.find({"_id": {"$in": list(raw_values)}}, {"_id": 1})
+            found[lookup_entity] = {str(d["_id"]) for d in docs}
+        elif lookup_entity in mapping.external_entities and conn is not None:
+            found[lookup_entity] = {
+                str(raw)
+                for raw in raw_values
+                if idmap.get(conn, lookup_entity, str(raw), schema=internal_schema) is not None
+            }
     return found
 
 
@@ -237,15 +263,21 @@ def run_fast_pass(
     mongo_uri: str,
     pg_schema: PostgresSchema,
     *,
+    postgres_dsn: str | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     sample_size: int | None = None,
     max_violations: int = DEFAULT_MAX_VIOLATIONS,
 ) -> DryRunReport:
+    """`postgres_dsn` is optional and read-only when given: it's only used
+    to check `_mongopg.id_map` for `lookup:`s that name an `external_entities`
+    entry (see `_check_existence`). Without it, external lookups simply
+    aren't checked — everything else about Layer A is unaffected."""
     order = mapping.entity_load_order()  # also surfaces CircularEntityDependencyError early
 
     client: MongoClient = MongoClient(mongo_uri)
     violations: list[DryRunViolation] = []
     truncated = False
+    pg_conn = psycopg.connect(postgres_dsn) if postgres_dsn else None
     try:
         db: Database = client.get_default_database()
         if db is None:
@@ -253,7 +285,7 @@ def run_fast_pass(
 
         for entity_name in order:
             entity = mapping.entities[entity_name]
-            cursor = db[entity.source].find().sort("_id", 1)
+            cursor = db[entity.source].find(entity.mongo_filter()).sort("_id", 1)
             if sample_size is not None:
                 cursor = cursor.limit(sample_size)
 
@@ -266,7 +298,7 @@ def run_fast_pass(
                     break
 
                 needs = _collect_batch_lookup_needs(batch, entity)
-                found = _check_existence(db, mapping, needs)
+                found = _check_existence(db, mapping, needs, conn=pg_conn)
 
                 for doc in batch:
                     violations.extend(_validate_id_strategy(doc, entity, entity_name))
@@ -309,6 +341,8 @@ def run_fast_pass(
                 break
     finally:
         client.close()
+        if pg_conn is not None:
+            pg_conn.close()
 
     return DryRunReport(violations=violations, truncated=truncated)
 
@@ -407,7 +441,9 @@ def run(
     `force_realistic=True`) — no point paying for a real COPY+FK pass
     against a mapping that's already known to fail. PRD §6 step 5: "Report
     combines both."""
-    report = run_fast_pass(mapping, mongo_uri, pg_schema, batch_size=batch_size, sample_size=sample_size)
+    report = run_fast_pass(
+        mapping, mongo_uri, pg_schema, postgres_dsn=postgres_dsn, batch_size=batch_size, sample_size=sample_size
+    )
     if report.ok or force_realistic:
         realistic = run_realistic_pass(mapping, mongo_uri, postgres_dsn, pg_schema, batch_size=batch_size)
         report.violations.extend(realistic.violations)

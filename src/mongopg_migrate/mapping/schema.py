@@ -147,11 +147,19 @@ class UnmappedPolicy(BaseModel):
     """Explicit disposition for source fields not otherwise mapped.
 
     PRD §7: "every source field must resolve to a column, an explicit
-    `drop`, or an explicit `jsonb` fallback — no silent drop."
+    `drop`, or an explicit `jsonb` fallback — no silent drop." `jsonb` is
+    only a real landing, not a label, when `jsonb_column` names an actual
+    jsonb/json column on the target table: migrate/load.py serializes every
+    field in `jsonb` into one JSON object and writes it there. A mapping
+    with `jsonb` fields but no `jsonb_column` is rejected at validation
+    time — the earlier design let `jsonb` be indistinguishable from `drop`
+    at load time, which silently broke the field-level "zero silent data
+    loss" promise the disposition itself makes (PRD §9).
     """
 
     drop: list[str] = Field(default_factory=list)
     jsonb: list[str] = Field(default_factory=list)
+    jsonb_column: str | None = None
 
     @property
     def dispositioned(self) -> set[str]:
@@ -164,6 +172,34 @@ class UnmappedPolicy(BaseModel):
             raise ValueError(f"fields listed in both drop and jsonb: {sorted(overlap)}")
         return self
 
+    @model_validator(mode="after")
+    def _jsonb_column_matches_jsonb_fields(self) -> UnmappedPolicy:
+        if self.jsonb and not self.jsonb_column:
+            raise ValueError(
+                "unmapped.jsonb is non-empty but unmapped.jsonb_column is not set — "
+                "without a target column, these fields would silently be dropped at load "
+                "time instead of landing anywhere (PRD §9 zero-silent-data-loss)"
+            )
+        if self.jsonb_column and not self.jsonb:
+            raise ValueError("unmapped.jsonb_column is set but unmapped.jsonb is empty — nothing to land there")
+        return self
+
+
+class FilterSpec(BaseModel):
+    """Restricts an entity to documents where `field == equals` — the
+    mechanism for "multiple mappings filtered by discriminator" (PRD §7 P0,
+    §6 step 3: a polymorphic collection like `payments` with a `type`
+    discriminator can become two entities, `payments_card` and
+    `payments_bank`, both with `source: payments` but different `filter`).
+    Applied everywhere the entity's documents are read: migrate/load.py's
+    Mongo query, dry-run Layer A's validation pass, and report/validate.py's
+    count and sample diffs — an unfiltered `count_documents({})` against a
+    split collection would count every other filtered entity's documents
+    too, which is exactly the bug this closes."""
+
+    field: str
+    equals: str | int | bool
+
 
 class EntityMapping(BaseModel):
     source: str
@@ -173,6 +209,7 @@ class EntityMapping(BaseModel):
     explode: dict[str, ExplodeSpec] = Field(default_factory=dict)
     junction: dict[str, JunctionSpec] = Field(default_factory=dict)
     unmapped: UnmappedPolicy = Field(default_factory=UnmappedPolicy)
+    filter: FilterSpec | None = None
 
     @field_validator("fields", mode="before")
     @classmethod
@@ -205,9 +242,27 @@ class EntityMapping(BaseModel):
             | {"_id"}  # always accounted for via id_strategy
         )
 
+    def mongo_filter(self) -> dict:
+        """The base Mongo query this entity's documents must always match —
+        `{}` unless `filter` restricts it to one discriminator value. Callers
+        (migrate/load.py, migrate/dryrun.py, report/validate.py) combine this
+        with their own per-call conditions (e.g. a resume cursor's `$gt`)."""
+        if self.filter is None:
+            return {}
+        return {self.filter.field: self.filter.equals}
+
 
 class MappingFile(BaseModel):
     entities: dict[str, EntityMapping]
+    # Entity names this file's `lookup:`s are allowed to reference without
+    # declaring them locally — PRD §12's own worked example assumes exactly
+    # this ("assume `users` was migrated in an earlier run"): a later run
+    # migrating only `orders` still needs `lookup: users` to resolve, via
+    # `_mongopg.id_map` rows a previous run already wrote. Declaring the name
+    # here (rather than silently allowing any unknown lookup target) keeps a
+    # genuine typo in `lookup:` a hard error instead of a false "it's
+    # external" pass.
+    external_entities: list[str] = Field(default_factory=list)
 
     def entity_dependencies(self) -> dict[str, set[str]]:
         """entity name -> set of entity names it `lookup:`s against, at any
@@ -296,39 +351,29 @@ def validate_structure(mapping: MappingFile) -> list[ValidationIssue]:
     lookup targets exist, references point at declared entities, etc."""
     issues: list[ValidationIssue] = []
     entity_names = set(mapping.entities.keys())
+    known_names = entity_names | set(mapping.external_entities)
+
+    def _check_lookup(name: str, field: str, lookup: str | None) -> None:
+        if not lookup or lookup in known_names:
+            return
+        issues.append(
+            ValidationIssue(
+                severity="error",
+                entity=name,
+                field=field,
+                message=f"lookup: {lookup!r} is not a declared entity and not listed in "
+                "`external_entities` — if it was migrated in an earlier run, add it there",
+            )
+        )
 
     for name, entity in mapping.entities.items():
         for fname, fspec in entity.fields.items():
-            if fspec.lookup and fspec.lookup not in entity_names:
-                issues.append(
-                    ValidationIssue(
-                        severity="error",
-                        entity=name,
-                        field=fname,
-                        message=f"lookup: {fspec.lookup!r} is not a declared entity",
-                    )
-                )
+            _check_lookup(name, fname, fspec.lookup)
         for ename, exp in entity.explode.items():
             for fname, fspec in exp.fields.items():
-                if fspec.lookup and fspec.lookup not in entity_names:
-                    issues.append(
-                        ValidationIssue(
-                            severity="error",
-                            entity=name,
-                            field=f"{ename}.{fname}",
-                            message=f"lookup: {fspec.lookup!r} is not a declared entity",
-                        )
-                    )
+                _check_lookup(name, f"{ename}.{fname}", fspec.lookup)
         for jname, junc in entity.junction.items():
-            if junc.child_fk.lookup and junc.child_fk.lookup not in entity_names:
-                issues.append(
-                    ValidationIssue(
-                        severity="error",
-                        entity=name,
-                        field=jname,
-                        message=f"child_fk.lookup: {junc.child_fk.lookup!r} is not a declared entity",
-                    )
-                )
+            _check_lookup(name, jname, junc.child_fk.lookup)
     return issues
 
 
@@ -341,7 +386,15 @@ def validate_against_mongo_schema(
     field names seen during introspection (see introspect/mongo.py)."""
     issues: list[ValidationIssue] = []
     for name, entity in mapping.entities.items():
-        observed = mongo_fields_by_entity.get(entity.source)
+        # Keyed by entity NAME, not entity.source — an entity can rename the
+        # collection it maps (name != source, e.g. a discriminator-filtered
+        # `payments_card` sourced from `payments`), and `entity.source` isn't
+        # even unique across entities in that case. Regression: this used to
+        # look up by `entity.source`, which silently degraded to the
+        # "no introspected schema found" branch below whenever name != source
+        # — the real check never ran, and the fixture never caught it because
+        # every entity in it happens to have name == source.
+        observed = mongo_fields_by_entity.get(name)
         if observed is None:
             issues.append(
                 ValidationIssue(

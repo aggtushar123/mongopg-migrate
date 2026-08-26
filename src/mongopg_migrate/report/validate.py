@@ -89,8 +89,9 @@ def _table_count(conn: psycopg.Connection, table: str) -> int:
         return n
 
 
-def _sum_array_length(db: Database, collection: str, field_name: str) -> int:
+def _sum_array_length(db: Database, collection: str, field_name: str, mongo_filter: dict) -> int:
     pipeline = [
+        *([{"$match": mongo_filter}] if mongo_filter else []),
         {"$project": {"n": {"$size": {"$ifNull": [f"${field_name}", []]}}}},
         {"$group": {"_id": None, "total": {"$sum": "$n"}}},
     ]
@@ -101,11 +102,17 @@ def _sum_array_length(db: Database, collection: str, field_name: str) -> int:
 def _count_diffs(db: Database, conn: psycopg.Connection, mapping: MappingFile) -> list[CountDiff]:
     diffs: list[CountDiff] = []
     for name, entity in mapping.entities.items():
+        # entity.mongo_filter() matters here specifically: without it, a
+        # discriminator-filtered entity (PRD §7 P0) would count every OTHER
+        # filtered entity's documents from the same collection too — a
+        # count_documents({}) that looks fine but is comparing the wrong
+        # numbers.
+        mongo_filter = entity.mongo_filter()
         diffs.append(
             CountDiff(
                 entity=name,
                 table=entity.target,
-                mongo_count=db[entity.source].count_documents({}),
+                mongo_count=db[entity.source].count_documents(mongo_filter),
                 postgres_count=_table_count(conn, entity.target),
             )
         )
@@ -114,7 +121,7 @@ def _count_diffs(db: Database, conn: psycopg.Connection, mapping: MappingFile) -
                 CountDiff(
                     entity=f"{name}.{ename}",
                     table=exp.target,
-                    mongo_count=_sum_array_length(db, entity.source, ename),
+                    mongo_count=_sum_array_length(db, entity.source, ename, mongo_filter),
                     postgres_count=_table_count(conn, exp.target),
                 )
             )
@@ -123,7 +130,7 @@ def _count_diffs(db: Database, conn: psycopg.Connection, mapping: MappingFile) -
                 CountDiff(
                     entity=f"{name}.{jname}",
                     table=junc.target,
-                    mongo_count=_sum_array_length(db, entity.source, jname),
+                    mongo_count=_sum_array_length(db, entity.source, jname, mongo_filter),
                     postgres_count=_table_count(conn, junc.target),
                 )
             )
