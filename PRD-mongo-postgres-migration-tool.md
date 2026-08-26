@@ -22,6 +22,7 @@ Teams migrating from MongoDB to a normalized PostgreSQL schema face a specific, 
 - No application/query-layer rewrite (ORM models, API code) — out of scope; this tool moves data only.
 - No GridFS support in v1.
 - No automatic resolution of circular foreign keys beyond standard Postgres `DEFERRABLE` constraints — a true cycle the schema doesn't already mark deferrable is a flagged error, not something the tool reorders around.
+- No fan-in aggregation in the mapping DSL — the mapping file's constructs (`fields`, `explode`, `junction`, `unpivot`, §7/§12) all describe *one* source document (or one item within it) producing rows; none of them can express *N* source documents collapsing into *one* target row (e.g. "the latest status-update document per booking"). That's a genuinely different shape of work — grouping/aggregation, not field mapping — and belongs upstream of this tool: reshape with a Mongo aggregation pipeline (`$out`/`$merge`) into an already one-to-one-shaped derived collection, then map that collection normally. (Doing so does move the `validate` boundary — post-migration validation then checks the derived collection against Postgres, not the original collection; that's a real, worth-stating tradeoff, not a hidden one.)
 
 ## 5. Target Users
 - Individual developers / small teams doing a one-time Mongo→Postgres migration.
@@ -45,7 +46,10 @@ Teams migrating from MongoDB to a normalized PostgreSQL schema face a specific, 
 | Explicit `id_strategy` per entity (ObjectId passthrough / UUID / serial + lookup) with ID remapping applied at load | P0 |
 | FK-derived load order (parents before children, or explicit deferred-constraint loading) | P0 |
 | Explode/unnest mapping — one collection → N tables, not just field=column | P0 |
+| Nested explode — a second embedded array one level down an already-exploded child (e.g. `facilities[].categoryParts[]` → a child table, each row itself the parent of a grandchild table). The middle level's own id must be resolvable *before* its row is written, so it can be threaded down as the grandchild's foreign key — `serial` is not usable at a level that has nested children under it, only at a true leaf | P0 |
 | Junction-table **mapping** (not generation — the join table must already exist in the target DDL, per §4's non-goal) for scalar-ID arrays (e.g. `tagIds: [ObjectId]` → existing `post_tags` table), FKs remapped via the same `id_strategy` lookup as regular explode | P0 |
+| Unpivot mapping — N differently-named top-level scalar fields (e.g. `pfAmount`/`payToHospital`/`finalBill`) → N rows in an existing table, each carrying a literal code identifying which source field it came from (the EAV/pivot-normalization pattern). Distinct from both `explode` (one array, one repeated shape) and `junction` (one array of scalar FKs) — neither can express "several differently-named fields, each becoming its own row" | P0 |
+| Explode/junction array-shape safety: a scalar value where an array is expected (e.g. a plain string mistakenly mapped via `junction:` instead of `fields: {lookup:}`) is rejected loudly — at dry-run as a flagged violation, at migrate time as a hard failure — never silently iterated (a string is technically iterable character-by-character in the host language; that must never become the actual migration behavior) | P0 |
 | Small transform DSL in the mapping file: cast, default, split, `json_extract`, enum mapping | P0 |
 | Polymorphic document detection (shape variance within one collection) + support for multiple mappings filtered by discriminator | P0 |
 | Human-editable mapping file (YAML/JSON) with a worked example checked into the repo (see §12) | P0 |
@@ -69,7 +73,7 @@ Teams migrating from MongoDB to a normalized PostgreSQL schema face a specific, 
   - `introspect/mongo.py` — sampling + type/variance inference; flags shape variance within a collection as a polymorphism candidate
   - `introspect/postgres.py` — schema + FK introspection; produces the dependency graph used for load ordering
   - `mapping/propose.py` — rule-based mapping generation (field/table matching, one-to-many split detection, `id_strategy` inference, discriminator detection for polymorphic collections). The optional LLM-assisted pass lives separately, in `mapping/llm_propose.py` (payload building, suggestion merge — never trusts a suggested column that doesn't exist or is already claimed) and `mapping/llm_client.py` (the pluggable `LLMClient` seam, provider-agnostic per the "Configurable to use local models" requirement below: `AnthropicLLMClient` for the Anthropic API, `OpenAICompatibleLLMClient` for any server speaking the OpenAI chat-completions contract — OpenAI, Azure OpenAI, Ollama, vLLM, LM Studio, and equivalents, with no added dependency) — kept out of propose.py so the rule-based path has no dependency on it, and runs strictly after it, only on fields propose.py already gave up on
-  - `mapping/schema.py` — mapping file format (YAML) load/validate; format must express explode/unnest (one collection → N tables), per-entity `id_strategy`, transforms (`cast`, `default`, `split`, `json_extract`, enum mapping), and discriminator-filtered sub-mappings — not just `field: column`
+  - `mapping/schema.py` — mapping file format (YAML) load/validate; format must express explode/unnest (one collection → N tables, itself recursively nestable one level further for a two-level embedded shape), unpivot (N named scalar fields → N rows, distinct from explode/junction), per-entity `id_strategy`, transforms (`cast`, `default`, `split`, `json_extract`, enum mapping), and discriminator-filtered sub-mappings — not just `field: column`
   - `migrate/dryrun.py` — two layers: (1) in-memory/staging validation of types, nulls, and transforms against sampled or full data, no Postgres write; (2) optional load into a disposable temp schema, into which every mapped table *and* the `id_map` rows it depends on are cloned first — FKs must resolve within that temp schema, never cross back to `public` — via the real COPY+FK path, to surface constraint/FK-order failures that only appear against live Postgres, then drop the temp schema
   - `migrate/load.py` — reads `--mode truncate|append` (P0; refuses `truncate` on a non-empty target without an explicit flag — `upsert` is P1, staging-table + `ON CONFLICT DO UPDATE`), derives load order from the Postgres FK graph, applies ID remapping by writing to the tool-owned `_mongopg.id_map(entity, source_id, target_id)` table in the target database (same transaction/checkpoint as the table load), COPY-based batch loading with **per-table checkpointing that includes `id_map` state**, so resume never re-loads a completed parent or leaves a lookup half-written
   - `report/validate.py` — post-migration count/diff report **plus** hashed-field sample diff to catch value-level mismatches that counts alone would miss
@@ -205,3 +209,97 @@ Notes this example is meant to pin down for implementers:
 - `explode` (embedded object/array → child table) and `junction` (scalar-ID array → existing many-to-many join table) are distinct constructs in the format — conflating them was a gap in the earlier draft. Neither construct creates a table; both map onto one that already exists in the target DDL.
 - `unmapped_fields` must resolve to empty or an explicit disposition; this is what the P0 unmapped-field policy in §7 actually validates against.
 - `upsert` is intentionally absent from this example — it's P1 (see §7); this sketch only needs to support `truncate`/`append`.
+
+### 12.1 Nested explode (two-level unnest)
+
+Real-world shape this exists for: a document whose embedded array itself contains an embedded array — e.g. a hospital with embedded facilities, each facility with its own embedded category-parts. One level of `explode` (§12 above) only reaches the first array; the second array needs `explode` to nest.
+
+Source Mongo document shape:
+```json
+{
+  "_id": ObjectId("64f3c4..."),
+  "facilities": [
+    {
+      "facilityId": "F1",
+      "name": "Cardiology Wing",
+      "categoryParts": [
+        { "partName": "ICU" },
+        { "partName": "OT" }
+      ]
+    }
+  ]
+}
+```
+
+Target Postgres DDL (already exists): `hospitals(id, ...)`, `hospital_facilities(id, hospital_id, name)`, `facility_category_parts(id, facility_id, part_name)`.
+
+Mapping:
+```yaml
+entities:
+  hospitals:
+    source: hospitals
+    target: hospitals
+    id_strategy: { type: objectid_to_uuid, source_field: _id }
+    explode:
+      facilities:
+        target: hospital_facilities
+        id_strategy:
+          type: objectid_to_uuid   # NOT serial — see note below
+          source_field: facilityId # identifies this embedded item; a facility's own id, if it has one
+        parent_fk: { target_field: hospital_id, references: hospitals.id }
+        fields:
+          name: name
+        # a second level of explode, nested inside the first
+        explode:
+          categoryParts:
+            target: facility_category_parts
+            id_strategy:
+              type: serial          # a true leaf (no explode below it) may still use serial
+            parent_fk: { target_field: facility_id, references: hospital_facilities.id }
+            fields:
+              partName: part_name
+```
+
+Note this example is meant to pin down for implementers: an `explode` level with its own nested `explode` children must resolve its id *before* its row is written (not left to a Postgres `SERIAL` default), because that id has to be threaded down as the nested level's `parent_fk` value — and a `SERIAL` value isn't knowable until after the row is inserted, which a bulk COPY load (§6 step 6) has no way to recover mid-batch. `id_strategy.type: serial` is therefore only valid on a level with no `explode` children of its own (a true leaf); every level above a leaf needs a resolvable, non-`serial` `id_strategy` (`objectid_to_uuid`, `uuid_generate`, `int_sequence`, or `passthrough`) with a `source_field` that identifies the embedded item (its own embedded `_id`, if Mongo assigned one, or another stable per-item field).
+
+### 12.2 Unpivot (pivot / EAV normalization)
+
+Real-world shape this exists for: a document with several *differently-named* scalar fields that the target schema normalizes into rows of a single table, each row tagged by a code identifying which source field it came from — e.g. a booking-payment document with `pfAmount`/`payToHospital`/`finalBill` fields, normalized into a `booking_amounts` table. Neither `explode` (one array, one repeated shape) nor `junction` (one array of scalar FKs) can express this — there's no source array here at all, just several named scalars sharing one destination shape.
+
+Source Mongo document shape:
+```json
+{
+  "_id": ObjectId("64f2b3..."),
+  "pfAmount": 150.5,
+  "payToHospital": 200,
+  "finalBill": 350.5
+}
+```
+
+Target Postgres DDL (already exists): `bookings(id, ...)`, `booking_amounts(id SERIAL, booking_id, code, amount)` — one row per present source field, `UNIQUE (booking_id, code)`.
+
+Mapping:
+```yaml
+entities:
+  bookings:
+    source: bookingPayment
+    target: bookings
+    id_strategy: { type: objectid_to_uuid, source_field: _id }
+    unpivot:
+      amounts:
+        target: booking_amounts
+        parent_fk: { target_field: booking_id, references: bookings.id }
+        code_column: code
+        value_column: amount
+        items:
+          - source_field: pfAmount
+            code: PF_AMOUNT
+          - source_field: payToHospital
+            code: PAY_TO_HOSPITAL
+          - source_field: finalBill
+            code: FINAL_BILL
+        skip_null: true    # default — a document missing one of these fields simply
+                            # produces no row for that code, rather than a null-valued row
+```
+
+Note this example is meant to pin down for implementers: `(parent_fk, code)` is a genuine natural key for an unpivot child row — unlike an `explode` child's synthetic `serial` PK, which has no natural conflict target — so `--mode upsert` (§7 P1) is meaningful here: re-running against a document whose `pfAmount` changed updates that one row in place rather than duplicating it.
