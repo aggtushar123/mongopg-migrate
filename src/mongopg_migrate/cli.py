@@ -21,6 +21,9 @@ import psycopg
 
 from mongopg_migrate.introspect.mongo import introspect_database
 from mongopg_migrate.introspect.postgres import CircularDependencyError, introspect_postgres
+from mongopg_migrate.mapping.llm_client import DEFAULT_MODEL as DEFAULT_LLM_MODEL
+from mongopg_migrate.mapping.llm_client import AnthropicLLMClient
+from mongopg_migrate.mapping.llm_propose import enrich_mapping_with_llm
 from mongopg_migrate.mapping.propose import propose_mapping
 from mongopg_migrate.mapping.schema import (
     CircularEntityDependencyError,
@@ -112,8 +115,22 @@ def introspect_cmd(mongo_uri: str, postgres_uri: str, sample_size: int | None, p
 @click.option("--sample-size", type=int, default=None)
 @click.option("--pg-schema", default="public")
 @click.option("-o", "--output", default="mapping.yaml", help="Where to write the proposed mapping file.")
+@click.option(
+    "--llm/--no-llm",
+    default=False,
+    help="Ask an LLM to suggest mappings for fields name-similarity couldn't resolve (PRD §7/§8 P1). "
+    "Off by default. Sends only schema metadata (field names/types/shapes), never row data. "
+    "Requires `pip install mongopg-migrate[llm]` and Anthropic credentials.",
+)
+@click.option("--llm-model", default=DEFAULT_LLM_MODEL)
 def propose_cmd(
-    mongo_uri: str, postgres_uri: str, sample_size: int | None, pg_schema: str, output: str
+    mongo_uri: str,
+    postgres_uri: str,
+    sample_size: int | None,
+    pg_schema: str,
+    output: str,
+    llm: bool,
+    llm_model: str,
 ) -> None:
     """Generate a candidate mapping.yaml (PRD §6 step 3). Always review and
     edit before running `migrate` — nothing here is auto-confirmed."""
@@ -123,6 +140,12 @@ def propose_cmd(
     pg = introspect_postgres(postgres_uri, schema=pg_schema)
 
     mapping, issues = propose_mapping(mongo_schemas, pg)
+
+    if llm:
+        click.echo("Asking LLM for suggestions on fields name-similarity couldn't resolve...", err=True)
+        llm_client = AnthropicLLMClient(model=llm_model)
+        issues += enrich_mapping_with_llm(llm_client, mapping, mongo_schemas, pg)
+
     dump_mapping_file(mapping, output)
     click.echo(f"Wrote candidate mapping to {output}", err=True)
 

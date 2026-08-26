@@ -25,6 +25,12 @@ dev = [
     "mongomock>=4.1",
     "ruff>=0.6",
 ]
+# PRD §8: LLM integration is pluggable and off by default — not a hard
+# dependency. Only needed for `propose --llm` with the default
+# AnthropicLLMClient (mapping/llm_client.py).
+llm = [
+    "anthropic>=1.0",
+]
 
 [project.scripts]
 mongopg-migrate = "mongopg_migrate.cli:main"

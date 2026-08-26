@@ -5,12 +5,15 @@ detection of likely one-to-many splits ... an inferred id_strategy per
 entity ... Ambiguous or low-confidence mappings are flagged, never silently
 guessed") and PRD §7's P0 "candidate field/table mapping generation".
 
-This is deliberately name/type heuristics only — no LLM call here (that's
-PRD §7/§8 P1, `mapping/propose.py`'s optional LLM-assisted path, not yet
-wired up). Everything this module emits is a *proposal*: PRD §6 step 4
-requires human review before anything is written to Postgres, so low-
-confidence guesses are safe to make as long as they're flagged, which is
-what `ProposalIssue` is for.
+This is deliberately name/type heuristics only — no LLM call here. The
+optional LLM-assisted path (PRD §7/§8 P1) lives in `mapping/llm_propose.py`
+and `mapping/llm_client.py`, and runs strictly *after* this module: it only
+sees the fields this module's rule-based matching already gave up on
+(`entity.unmapped.drop`/`.jsonb`), never revisits what this module was
+confident about. Everything both modules emit is a *proposal*: PRD §6
+step 4 requires human review before anything is written to Postgres, so
+low-confidence guesses are safe to make as long as they're flagged, which
+is what `ProposalIssue` is for.
 """
 
 from __future__ import annotations
