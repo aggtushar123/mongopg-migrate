@@ -71,6 +71,9 @@ def test_trim_preserves_internal_whitespace():
 
 
 def test_trim_handles_the_padding_case_that_motivated_it():
+    # An 18-character reference number followed by ~48 KB of spaces, which is
+    # the shape that overflowed a varchar(128). The value is synthetic; the
+    # length and the padding are what the test is about.
     padded = "180000000000000042" + " " * 48_000
     assert apply_transform("trim", padded) == "180000000000000042"
 
