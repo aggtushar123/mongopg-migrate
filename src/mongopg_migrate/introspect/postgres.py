@@ -15,6 +15,10 @@ from dataclasses import dataclass, field
 import psycopg
 
 
+class SchemaNotFoundError(Exception):
+    """Raised when --pg-schema names a schema that is not in the database."""
+
+
 class CircularDependencyError(Exception):
     """Raised when the target schema has a foreign-key cycle that is not
     fully DEFERRABLE (PRD §4 non-goal, §10 risk)."""
@@ -114,6 +118,22 @@ class PostgresSchema:
 def introspect_postgres(dsn: str, *, schema: str = "public") -> PostgresSchema:
     result = PostgresSchema()
     with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        # A schema that does not exist returned an empty PostgresSchema, which
+        # every downstream command then read as "the target has no tables" —
+        # so a typo in --pg-schema surfaced as a confusing mapping error rather
+        # than as itself. Say so here instead.
+        cur.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name = %s", (schema,))
+        if cur.fetchone() is None:
+            cur.execute(
+                "SELECT schema_name FROM information_schema.schemata "
+                "WHERE schema_name NOT LIKE 'pg\\_%%' AND schema_name <> 'information_schema' "
+                "ORDER BY schema_name"
+            )
+            available = [r[0] for r in cur.fetchall()]
+            raise SchemaNotFoundError(
+                f"schema {schema!r} does not exist in this database. "
+                f"Available: {', '.join(available) or '(none)'}"
+            )
         cur.execute(
             """
                 SELECT table_name FROM information_schema.tables

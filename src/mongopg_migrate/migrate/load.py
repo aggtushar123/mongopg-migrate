@@ -75,9 +75,11 @@ from __future__ import annotations
 import itertools
 import os
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import psycopg
+from psycopg import sql
 from psycopg.types.json import Jsonb
 from pymongo import MongoClient
 from pymongo.database import Database
@@ -96,6 +98,8 @@ from mongopg_migrate.migrate import checkpoint, idmap
 from mongopg_migrate.migrate.idstrategy import resolve_new_id
 from mongopg_migrate.migrate.transform import apply_default, apply_transform, get_nested, json_safe
 
+# The Postgres schema holding the target tables, unless --pg-schema says otherwise.
+DEFAULT_TARGET_SCHEMA = "public"
 DEFAULT_BATCH_SIZE = 500
 SUPPORTED_MODES = ("truncate", "append", "upsert")
 
@@ -963,15 +967,27 @@ def load(
     mode: str = "truncate",
     batch_size: int = DEFAULT_BATCH_SIZE,
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
-    search_path: str | None = None,
+    target_schema: str = DEFAULT_TARGET_SCHEMA,
+    search_path: Sequence[str] | None = None,
 ) -> LoadSummary:
-    """`internal_schema` and `search_path` exist for migrate/dryrun.py's
+    """`target_schema` is the Postgres schema holding the target tables.
+
+    Every write in this module names its table WITHOUT a schema qualifier
+    (`COPY "orders"`, `TRUNCATE ...`), so what that resolves to is decided
+    entirely by `search_path`. It used to be left at whatever the connecting
+    role happened to default to, which meant `--pg-schema` selected the
+    schema that was *introspected* while the load still wrote somewhere else
+    — silently, and only for the users whose tables do not live in `public`.
+    It is now always set explicitly from `target_schema`.
+
+    `internal_schema` and `search_path` exist for migrate/dryrun.py's
     realistic pass: it points both at disposable, uniquely-named values so a
     dry run never writes into the real `_mongopg.id_map`/`load_checkpoint`
     (which would make a later real `migrate` think entities are already
-    loaded) and never writes into the real target tables (`search_path`
-    redirects the unqualified table names this module writes to). Regular
-    callers should leave both at their defaults.
+    loaded) and never writes into the real target tables. `search_path` is a
+    SEQUENCE OF SCHEMA NAMES, quoted here via psycopg's identifier
+    composition — never interpolated as raw SQL. Regular callers should
+    leave both at their defaults and pass `target_schema`.
     """
     if mode not in SUPPORTED_MODES:
         raise ValueError(f"mode={mode!r} not supported — use one of {SUPPORTED_MODES}")
@@ -987,9 +1003,15 @@ def load(
 
         with psycopg.connect(postgres_dsn) as conn:
             conn.autocommit = False
-            if search_path is not None:
-                with conn.cursor() as cur:
-                    cur.execute(f"SET search_path TO {search_path}")
+            # Always set it: an unset search_path is what let a load write
+            # outside --pg-schema. Identifiers are composed, not formatted.
+            resolved_path = list(search_path) if search_path is not None else [target_schema]
+            with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("SET search_path TO {}").format(
+                        sql.SQL(", ").join(sql.Identifier(s) for s in resolved_path)
+                    )
+                )
             idmap.ensure_schema(conn, schema=internal_schema)
             checkpoint.ensure_schema(conn, schema=internal_schema)
             conn.commit()

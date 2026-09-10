@@ -59,6 +59,7 @@ from mongopg_migrate.mapping.schema import (
 )
 from mongopg_migrate.migrate import idmap
 from mongopg_migrate.migrate.load import (
+    DEFAULT_TARGET_SCHEMA,
     LoadError,
     close_external_connections,
     open_external_connections,
@@ -600,7 +601,7 @@ def run_fast_pass(
 
 
 def _clone_schema_for_dryrun(
-    conn: psycopg.Connection, mapping: MappingFile, pg_schema: PostgresSchema, *, source_schema: str = "public"
+    conn: psycopg.Connection, mapping: MappingFile, pg_schema: PostgresSchema, *, source_schema: str = DEFAULT_TARGET_SCHEMA
 ) -> str:
     temp_schema = f"migrate_dryrun_{uuid.uuid4().hex[:10]}"
     tables = sorted(_mapped_tables(mapping))
@@ -693,6 +694,7 @@ def run_realistic_pass(
     pg_schema: PostgresSchema,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    target_schema: str = DEFAULT_TARGET_SCHEMA,
 ) -> DryRunReport:
     internal_schema = f"_mongopg_dryrun_{uuid.uuid4().hex[:10]}"
     violations: list[DryRunViolation] = []
@@ -700,7 +702,7 @@ def run_realistic_pass(
     with psycopg.connect(postgres_dsn) as setup_conn:
         setup_conn.autocommit = True
         try:
-            temp_schema = _clone_schema_for_dryrun(setup_conn, mapping, pg_schema)
+            temp_schema = _clone_schema_for_dryrun(setup_conn, mapping, pg_schema, source_schema=target_schema)
         except psycopg.Error as e:
             return DryRunReport(
                 violations=[DryRunViolation(entity="<schema clone>", layer="realistic", field=None, message=str(e))]
@@ -713,7 +715,9 @@ def run_realistic_pass(
             idmap.ensure_schema(setup_conn, schema=internal_schema)
             _seed_external_id_map(setup_conn, mapping, internal_schema)
 
-            search_path = f'"{temp_schema}", public'
+            # The clone first, then the real target schema — NOT a literal
+            # `public`, which silently ignored --pg-schema.
+            search_path = [temp_schema, target_schema]
             run_batch_load(
                 mapping,
                 mongo_uri,
@@ -748,6 +752,7 @@ def run(
     batch_size: int = DEFAULT_BATCH_SIZE,
     sample_size: int | None = None,
     force_realistic: bool = False,
+    target_schema: str = DEFAULT_TARGET_SCHEMA,
 ) -> DryRunReport:
     """Runs Layer A always; runs Layer B only if Layer A found nothing (or
     `force_realistic=True`) — no point paying for a real COPY+FK pass
@@ -757,6 +762,8 @@ def run(
         mapping, mongo_uri, pg_schema, postgres_dsn=postgres_dsn, batch_size=batch_size, sample_size=sample_size
     )
     if report.ok or force_realistic:
-        realistic = run_realistic_pass(mapping, mongo_uri, postgres_dsn, pg_schema, batch_size=batch_size)
+        realistic = run_realistic_pass(
+            mapping, mongo_uri, postgres_dsn, pg_schema, batch_size=batch_size, target_schema=target_schema
+        )
         report.violations.extend(realistic.violations)
     return report

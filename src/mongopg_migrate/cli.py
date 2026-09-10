@@ -25,7 +25,11 @@ from mongopg_migrate.introspect.mongo import (
     introspect_entities,
     list_collection_names,
 )
-from mongopg_migrate.introspect.postgres import CircularDependencyError, introspect_postgres
+from mongopg_migrate.introspect.postgres import (
+    CircularDependencyError,
+    SchemaNotFoundError,
+    introspect_postgres,
+)
 from mongopg_migrate.mapping.llm_client import (
     DEFAULT_ANTHROPIC_MODEL,
     LLMClientError,
@@ -57,6 +61,20 @@ POSTGRES_URI_OPTION = click.option(
 )
 
 
+def _introspect_pg(postgres_uri: str, pg_schema: str):
+    """`introspect_postgres`, with a bad --pg-schema reported as a user error.
+
+    Named schemas are the common case for anyone who is not migrating into
+    `public`, and a typo here used to surface much later as a confusing
+    mapping error against an empty target.
+    """
+    try:
+        return introspect_postgres(postgres_uri, schema=pg_schema)
+    except SchemaNotFoundError as e:
+        click.echo(f"ERROR: {e}", err=True)
+        sys.exit(1)
+
+
 @click.group()
 @click.version_option()
 def main() -> None:
@@ -76,7 +94,7 @@ def introspect_cmd(mongo_uri: str, postgres_uri: str, sample_size: int | None, p
     mongo_schemas = introspect_database(mongo_uri, sample_size=sample_size)
 
     click.echo("Introspecting PostgreSQL...", err=True)
-    pg = introspect_postgres(postgres_uri, schema=pg_schema)
+    pg = _introspect_pg(postgres_uri, pg_schema)
 
     try:
         load_order = pg.load_order()
@@ -124,7 +142,7 @@ def introspect_cmd(mongo_uri: str, postgres_uri: str, sample_size: int | None, p
 @MONGO_URI_OPTION
 @POSTGRES_URI_OPTION
 @click.option("--sample-size", type=int, default=None)
-@click.option("--pg-schema", default="public")
+@click.option("--pg-schema", default="public", help="Postgres schema holding the target tables.")
 @click.option("-o", "--output", default="mapping.yaml", help="Where to write the proposed mapping file.")
 @click.option(
     "--llm/--no-llm",
@@ -179,7 +197,7 @@ def propose_cmd(
     click.echo("Introspecting MongoDB...", err=True)
     mongo_schemas = introspect_database(mongo_uri, sample_size=sample_size)
     click.echo("Introspecting PostgreSQL...", err=True)
-    pg = introspect_postgres(postgres_uri, schema=pg_schema)
+    pg = _introspect_pg(postgres_uri, pg_schema)
 
     mapping, issues = propose_mapping(mongo_schemas, pg)
 
@@ -287,7 +305,7 @@ def validate_mapping_cmd(mapping_path: str, mongo_uri: str | None, sample_size: 
 @click.argument("mapping_path")
 @MONGO_URI_OPTION
 @POSTGRES_URI_OPTION
-@click.option("--pg-schema", default="public")
+@click.option("--pg-schema", default="public", help="Postgres schema holding the target tables.")
 @click.option("--batch-size", type=int, default=500)
 @click.option("--sample-size", type=int, default=None, help="Limit Layer A to a sample instead of the full dataset.")
 @click.option(
@@ -318,12 +336,13 @@ def dry_run_cmd(
         sys.exit(1)
 
     click.echo("Introspecting PostgreSQL...", err=True)
-    pg = introspect_postgres(postgres_uri, schema=pg_schema)
+    pg = _introspect_pg(postgres_uri, pg_schema)
 
     try:
         if realistic is None:
             report = dryrun.run(
-                mapping, mongo_uri, postgres_uri, pg, batch_size=batch_size, sample_size=sample_size
+                mapping, mongo_uri, postgres_uri, pg, batch_size=batch_size, sample_size=sample_size,
+                target_schema=pg_schema,
             )
         elif realistic:
             click.echo("Running Layer A (fast pass)...", err=True)
@@ -331,7 +350,9 @@ def dry_run_cmd(
                 mapping, mongo_uri, pg, postgres_dsn=postgres_uri, batch_size=batch_size, sample_size=sample_size
             )
             click.echo("Running Layer B (realistic pass, disposable schema clone)...", err=True)
-            realistic_report = dryrun.run_realistic_pass(mapping, mongo_uri, postgres_uri, pg, batch_size=batch_size)
+            realistic_report = dryrun.run_realistic_pass(
+                mapping, mongo_uri, postgres_uri, pg, batch_size=batch_size, target_schema=pg_schema
+            )
             report.violations.extend(realistic_report.violations)
         else:
             report = dryrun.run_fast_pass(
@@ -381,7 +402,7 @@ def dry_run_cmd(
     "upsert requires a unique constraint on each junction table's two FK columns; explode child tables "
     "(SERIAL keys, no natural conflict target) always insert regardless of mode.",
 )
-@click.option("--pg-schema", default="public")
+@click.option("--pg-schema", default="public", help="Postgres schema holding the target tables.")
 @click.option("--batch-size", type=int, default=500)
 def migrate_cmd(
     mapping_path: str, mongo_uri: str, postgres_uri: str, mode: str, pg_schema: str, batch_size: int
@@ -411,10 +432,12 @@ def migrate_cmd(
             )
 
     click.echo("Introspecting PostgreSQL (for FK graph, column types, and truncate order)...", err=True)
-    pg = introspect_postgres(postgres_uri, schema=pg_schema)
+    pg = _introspect_pg(postgres_uri, pg_schema)
 
     try:
-        summary = run_load(mapping, mongo_uri, postgres_uri, pg, mode=mode, batch_size=batch_size)
+        summary = run_load(
+            mapping, mongo_uri, postgres_uri, pg, mode=mode, batch_size=batch_size, target_schema=pg_schema
+        )
     except CircularEntityDependencyError as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)
@@ -491,7 +514,7 @@ def migrate_cmd(
 @click.argument("mapping_path")
 @MONGO_URI_OPTION
 @POSTGRES_URI_OPTION
-@click.option("--pg-schema", default="public")
+@click.option("--pg-schema", default="public", help="Postgres schema holding the target tables.")
 @click.option(
     "--sample-size",
     type=int,
@@ -508,10 +531,12 @@ def validate_cmd(
     mapping = load_mapping_file(mapping_path)
 
     click.echo("Introspecting PostgreSQL...", err=True)
-    pg = introspect_postgres(postgres_uri, schema=pg_schema)
+    pg = _introspect_pg(postgres_uri, pg_schema)
 
     try:
-        report = run_validate(mapping, mongo_uri, postgres_uri, pg, sample_size=sample_size)
+        report = run_validate(
+            mapping, mongo_uri, postgres_uri, pg, sample_size=sample_size, target_schema=pg_schema
+        )
     except ValidationError as e:
         click.echo(f"ERROR: {e}", err=True)
         sys.exit(1)

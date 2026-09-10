@@ -111,6 +111,32 @@ the seeded fixture data (orders → orders/order_items/order_tags) matching
 the PRD §12 example — a reference for what `propose` should get most of the
 way to on its own.
 
+### Targeting a schema other than `public`
+
+Every command takes `--pg-schema` (default `public`). It selects the schema
+that is introspected **and** the one the load writes into, so pass the same
+value to every command in a run:
+
+```bash
+mongopg-migrate dry-run  mapping.yaml --pg-schema app ...
+mongopg-migrate migrate  mapping.yaml --pg-schema app ...
+mongopg-migrate validate mapping.yaml --pg-schema app ...
+```
+
+Two notes:
+
+- The tool sets `search_path` explicitly for the duration of the run, so the
+  connecting role's own `search_path` does not affect where data lands.
+  Before v0.1.1 it did: `--pg-schema` chose what was *read* while writes
+  followed the role's default, which silently loaded a non-`public` target
+  into the wrong schema. If you ran an earlier version against a named
+  schema, check where the rows actually are.
+- `_mongopg` (the internal `id_map`/checkpoint schema) is always its own
+  schema and is not affected by `--pg-schema`.
+
+A schema that does not exist is now reported as such, with the available
+schemas listed, rather than looking like a target with no tables.
+
 ### Splitting one Mongo source across N Postgres databases (e.g. microservices)
 
 Each `mongopg-migrate` run targets exactly one `--postgres-uri` — the tool

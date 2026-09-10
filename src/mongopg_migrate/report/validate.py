@@ -49,6 +49,7 @@ from decimal import Decimal
 from typing import Any
 
 import psycopg
+from psycopg import sql
 from pymongo import MongoClient
 from pymongo.database import Database
 
@@ -63,6 +64,7 @@ from mongopg_migrate.mapping.schema import (
 )
 from mongopg_migrate.migrate import idmap
 from mongopg_migrate.migrate.load import (
+    DEFAULT_TARGET_SCHEMA,
     LoadError,
     close_external_connections,
     open_external_connections,
@@ -824,7 +826,16 @@ def validate(
     *,
     sample_size: int = DEFAULT_SAMPLE_SIZE,
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
+    target_schema: str = DEFAULT_TARGET_SCHEMA,
 ) -> ValidationReport:
+    """`target_schema` must match the one `migrate` wrote to.
+
+    Both `_table_count` and the sample-diff row fetch name their table
+    without a schema qualifier, so validating a non-`public` migration used
+    to count whatever the connecting role's search_path happened to resolve
+    — reporting a clean pass against the wrong tables, or failing to find
+    them at all. Set from --pg-schema, exactly as the load is.
+    """
     client: MongoClient = MongoClient(mongo_uri)
     try:
         external_conns = open_external_connections(mapping)
@@ -838,6 +849,9 @@ def validate(
 
         with psycopg.connect(postgres_dsn) as conn:
             with conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("SET search_path TO {}").format(sql.Identifier(target_schema))
+                )
                 cur.execute(
                     "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s", (internal_schema,)
                 )
