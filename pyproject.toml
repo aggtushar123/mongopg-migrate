@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mongopg-migrate"
-version = "0.1.1"
+version = "0.2.0"
 description = "Map MongoDB collections onto an existing, independently designed PostgreSQL schema and run a validated, repeatable migration."
 readme = "README.md"
 requires-python = ">=3.11"

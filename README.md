@@ -1,7 +1,7 @@
 # mongopg-migrate
 
 [![CI](https://github.com/aggtushar123/mongopg-migrate/actions/workflows/ci.yml/badge.svg)](https://github.com/aggtushar123/mongopg-migrate/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/aggtushar123/mongopg-migrate/blob/main/LICENSE)
 
 Map MongoDB collections onto an **existing, independently designed**
 PostgreSQL schema, and run a validated, repeatable data migration — without
@@ -10,7 +10,7 @@ hand-writing a transform script.
 This is not a tool that generates a Postgres schema from your Mongo shape.
 You bring the target DDL (greenfield design, a rewrite, or ORM models you
 already built); this tool figures out — and has you confirm — how your
-Mongo documents map onto it. See [`PRD-mongo-postgres-migration-tool.md`](./PRD-mongo-postgres-migration-tool.md)
+Mongo documents map onto it. See [`PRD-mongo-postgres-migration-tool.md`](https://github.com/aggtushar123/mongopg-migrate/blob/main/PRD-mongo-postgres-migration-tool.md)
 for the full product spec; module docstrings in `src/mongopg_migrate/`
 reference PRD section numbers throughout.
 
@@ -51,7 +51,7 @@ target schema before you trust it with anything you cannot rebuild.
 Each row links to the tests that back it, and only to tests that exist. The
 detailed history behind these — the bugs, why each fix is shaped the way it
 is, and which claims rest on a hand-run session rather than a test — is in
-[`docs/engineering-log.md`](./docs/engineering-log.md), where every entry is
+[`docs/engineering-log.md`](https://github.com/aggtushar123/mongopg-migrate/blob/main/docs/engineering-log.md), where every entry is
 labelled with the evidence that actually supports it.
 
 ## Install
@@ -62,7 +62,7 @@ pip install mongopg-migrate
 
 Two commands are installed: `mongopg-migrate` (the migration tool) and
 `mongopg-fanin` (a Mongo-side reshape helper for the fan-in case — see
-[`docs/fanin-reshape.md`](./docs/fanin-reshape.md)).
+[`docs/fanin-reshape.md`](https://github.com/aggtushar123/mongopg-migrate/blob/main/docs/fanin-reshape.md)).
 
 Or as a container, with no Python install at all:
 
@@ -70,7 +70,7 @@ Or as a container, with no Python install at all:
 docker pull ghcr.io/aggtushar123/mongopg-migrate:latest
 ```
 
-Python 3.11+. For working on the tool itself, see [Development](#development).
+Python 3.11+. For working on the tool itself, see [Development](https://github.com/aggtushar123/mongopg-migrate/blob/main/README.md#development).
 
 ## Try it
 

@@ -11,6 +11,8 @@ under **Changed** with a migration note.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-10
+
 ### Changed
 
 - **`--mode truncate` now asks for confirmation.** It lists the tables it will
@@ -33,7 +35,6 @@ under **Changed** with a migration note.
   hit in development because the largest entity there was ~65k rows. Above the
   cap, lookups go per row with a bounded cache in front — slower, but it cannot
   exhaust memory, and the run says so rather than failing silently.
-
 - `--internal-schema` and `--uuid-namespace`. Both were parameterised in code
   and unreachable from outside it. The first renames the schema holding
   `id_map`/`load_checkpoint`, for a target whose owner will not grant
@@ -149,5 +150,6 @@ tagged or distributed, so everything below is new to anyone installing this.
   label. One capability is still marked unproven: the Docker image is
   hand-verified, with no test asserting it behaves.
 
-[Unreleased]: https://github.com/aggtushar123/mongopg-migrate/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/aggtushar123/mongopg-migrate/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/aggtushar123/mongopg-migrate/releases/tag/v0.2.0
 [0.1.1]: https://github.com/aggtushar123/mongopg-migrate/releases/tag/v0.1.1
