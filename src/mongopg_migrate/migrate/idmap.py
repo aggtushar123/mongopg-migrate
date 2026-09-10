@@ -64,11 +64,55 @@ _PREFETCHED: weakref.WeakKeyDictionary[psycopg.Connection, dict[tuple[str, str],
 )
 
 
-def prefetch(conn: psycopg.Connection, entity: str, *, schema: str = DEFAULT_SCHEMA_NAME) -> int:
+# How many id_map rows may be held in memory for one entity.
+#
+# The snapshot is roughly 200 bytes per row (two id strings plus dict
+# overhead), so 2M rows is ~400 MB for ONE entity — and an entity that looks
+# up several others holds several snapshots at once. Without a ceiling this
+# is unbounded: a 50M-row referenced entity would need something like 12 GB
+# before the first document is processed. That was never hit in development
+# because the largest entity there was ~65k rows.
+DEFAULT_PREFETCH_MAX_ROWS = 2_000_000
+
+# Positive lookups remembered per entity when the snapshot is too large to
+# hold. Not authoritative — see `get()`.
+DEFAULT_FALLBACK_CACHE_SIZE = 250_000
+
+_FALLBACK: weakref.WeakKeyDictionary[psycopg.Connection, dict[tuple[str, str], dict[str, str]]] = (
+    weakref.WeakKeyDictionary()
+)
+_FALLBACK_LIMIT = DEFAULT_FALLBACK_CACHE_SIZE
+
+
+def set_fallback_cache_size(size: int) -> None:
+    global _FALLBACK_LIMIT
+    _FALLBACK_LIMIT = max(0, size)
+
+
+def prefetch(
+    conn: psycopg.Connection,
+    entity: str,
+    *,
+    schema: str = DEFAULT_SCHEMA_NAME,
+    max_rows: int | None = DEFAULT_PREFETCH_MAX_ROWS,
+) -> int:
     """Load one entity's entire id_map into memory for this connection.
 
-    Returns the number of rows cached. Re-prefetching replaces the snapshot.
+    Returns the number of rows cached, or -1 when the entity is larger than
+    `max_rows` and was deliberately NOT cached — the caller reports that, and
+    `get()` falls back to querying with a bounded cache in front of it.
+
+    The count comes first, on purpose: fetching the rows to discover there are
+    too many of them is the failure this exists to prevent. `max_rows=None`
+    restores the old unbounded behaviour for a caller that knows its data.
     """
+    if max_rows is not None:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT count(*) FROM {_qualified(schema)} WHERE entity = %s", (entity,))
+            (n,) = cur.fetchone()
+        if n > max_rows:
+            return -1
+
     with conn.cursor() as cur:
         cur.execute(f"SELECT source_id, target_id FROM {_qualified(schema)} WHERE entity = %s", (entity,))
         rows = cur.fetchall()
@@ -81,11 +125,13 @@ def is_prefetched(conn: psycopg.Connection, entity: str, *, schema: str = DEFAUL
 
 
 def clear_prefetch(conn: psycopg.Connection | None = None) -> None:
-    """Drop cached snapshots — for one connection, or all of them."""
+    """Drop cached snapshots and fallback caches — one connection, or all."""
     if conn is None:
         _PREFETCHED.clear()
+        _FALLBACK.clear()
     else:
         _PREFETCHED.pop(conn, None)
+        _FALLBACK.pop(conn, None)
 
 
 def _write_through(conn: psycopg.Connection, entries: list[tuple[str, str, str]], schema: str) -> None:
@@ -217,13 +263,35 @@ def get(
     snapshot = _PREFETCHED.get(conn, {}).get((schema, entity))
     if snapshot is not None:
         return snapshot.get(str(source_id))
+
+    # No snapshot: either this caller never prefetched (validate.py, dryrun.py)
+    # or the entity was too large to hold. A small cache in front of the query
+    # covers the common shape where many rows reference the same few parents.
+    #
+    # It is deliberately NOT authoritative, unlike a snapshot: entries are only
+    # ever added for rows that EXIST, so a miss here means "not cached", never
+    # "not present", and must still hit the database. Treating a bounded cache
+    # as authoritative is how `on_missing` would start firing on rows that are
+    # perfectly fine.
+    key = (schema, entity)
+    cached = _FALLBACK.get(conn, {}).get(key)
+    if cached is not None:
+        hit = cached.get(str(source_id))
+        if hit is not None:
+            return hit
+
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT target_id FROM {_qualified(schema)} WHERE entity = %s AND source_id = %s",
             (entity, source_id),
         )
         row = cur.fetchone()
-        return row[0] if row else None
+    if row and _FALLBACK_LIMIT:
+        store = _FALLBACK.setdefault(conn, {}).setdefault(key, {})
+        if len(store) >= _FALLBACK_LIMIT:
+            store.clear()  # simplest bound that cannot grow; keeps recency roughly
+        store[str(source_id)] = str(row[0])
+    return row[0] if row else None
 
 
 def is_loaded(

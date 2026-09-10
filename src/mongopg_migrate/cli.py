@@ -16,12 +16,13 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import uuid
 
 import click
 import psycopg
 
-from mongopg_migrate.connerrors import friendly_connection_errors
+from mongopg_migrate.connerrors import friendly_connection_errors, redact_uri
 from mongopg_migrate.introspect.mongo import (
     introspect_database,
     introspect_entities,
@@ -50,7 +51,7 @@ from mongopg_migrate.mapping.schema import (
     validate_structure,
 )
 from mongopg_migrate.migrate import dryrun, idmap
-from mongopg_migrate.migrate.load import DEFAULT_UUID_NAMESPACE, LoadError
+from mongopg_migrate.migrate.load import DEFAULT_UUID_NAMESPACE, LoadError, _mapped_tables
 from mongopg_migrate.migrate.load import load as run_load
 from mongopg_migrate.report.validate import ValidationError
 from mongopg_migrate.report.validate import validate as run_validate
@@ -61,6 +62,28 @@ MONGO_URI_OPTION = click.option(
 POSTGRES_URI_OPTION = click.option(
     "--postgres-uri", envvar="POSTGRES_URI", required=True, help="Target PostgreSQL connection string."
 )
+
+
+def _throttled_progress(min_interval: float = 5.0):
+    """Print progress often enough to show life, rarely enough to read.
+
+    `load()` reports once per batch, which at the default batch size is every
+    500 rows — ten thousand lines for a five-million-row entity. The point of
+    the output is to distinguish "working" from "hung" on a long run, and one
+    line every few seconds does that; one line per batch just moves the
+    problem. Notices that are not progress (an id_map too large to hold) are
+    never throttled.
+    """
+    state = {"last": 0.0}
+
+    def emit(line: str) -> None:
+        now = time.monotonic()
+        if "loaded so far" in line and now - state["last"] < min_interval:
+            return
+        state["last"] = now
+        click.echo(line, err=True)
+
+    return emit
 
 
 def _introspect_pg(postgres_uri: str, pg_schema: str):
@@ -448,10 +471,31 @@ def dry_run_cmd(
     "ids minted by an earlier cutover under a different namespace. It must not change "
     "partway through a migration; a resume under a different one is refused.",
 )
+@click.option(
+    "--only",
+    multiple=True,
+    help="Run only these entities (repeatable). Load order still comes from the full graph, "
+    "so a selected entity keeps its place; the rest are simply not run.",
+)
+@click.option(
+    "--idmap-prefetch-max",
+    type=int,
+    default=idmap.DEFAULT_PREFETCH_MAX_ROWS,
+    show_default=True,
+    help="Most id_map rows to hold in memory per referenced entity. Above this the entity "
+    "is looked up per row instead — slower, but it cannot exhaust memory.",
+)
+@click.option(
+    "--yes", "-y",
+    is_flag=True,
+    default=False,
+    help="Skip the confirmation prompt. Required for non-interactive use with --mode truncate.",
+)
 @friendly_connection_errors
 def migrate_cmd(
     mapping_path: str, mongo_uri: str, postgres_uri: str, mode: str, pg_schema: str,
     batch_size: int, internal_schema: str, uuid_namespace: uuid.UUID,
+    only: tuple[str, ...], idmap_prefetch_max: int, yes: bool,
 ) -> None:
     """PRD §6 step 6: FK/lookup-ordered COPY + `_mongopg.id_map` + per-batch
     checkpoint/resume. Re-running after a kill resumes automatically."""
@@ -480,11 +524,40 @@ def migrate_cmd(
     click.echo("Introspecting PostgreSQL (for FK graph, column types, and truncate order)...", err=True)
     pg = _introspect_pg(postgres_uri, pg_schema)
 
+    # Checked here, before anything connects or writes: raising this from
+    # inside load() reaches the user wearing a rollback-and-resume footer that
+    # describes a run which never started.
+    unknown = sorted(set(only) - set(mapping.entities))
+    if unknown:
+        click.echo(
+            f"ERROR: --only names {', '.join(unknown)}, which is not an entity in this mapping "
+            f"file. Known entities: {', '.join(sorted(mapping.entities))}",
+            err=True,
+        )
+        sys.exit(1)
+
+    # `truncate` empties every table this mapping writes to before loading.
+    # That is the documented behaviour and often the right one, but it is one
+    # shell-history recall away from being run against the wrong database, so
+    # it asks — and says exactly which tables and which server, since the
+    # answer to "am I pointed at production" is the whole question.
+    if mode == "truncate" and not yes:
+        targets = sorted(_mapped_tables(mapping, only=set(only) or None))
+        click.echo("", err=True)
+        click.echo(f"  --mode truncate will EMPTY {len(targets)} table(s) in {pg_schema!r}:", err=True)
+        click.echo(f"    {', '.join(targets)}", err=True)
+        click.echo(f"  on {redact_uri(postgres_uri)}", err=True)
+        if not click.confirm("\n  Continue?", default=False, err=True):
+            click.echo("Aborted; nothing was written.", err=True)
+            sys.exit(1)
+
     try:
         summary = run_load(
             mapping, mongo_uri, postgres_uri, pg, mode=mode, batch_size=batch_size,
             target_schema=pg_schema, internal_schema=internal_schema,
-            uuid_namespace=uuid_namespace,
+            uuid_namespace=uuid_namespace, prefetch_max_rows=idmap_prefetch_max,
+            only=set(only) or None,
+            progress=_throttled_progress(),
         )
     except CircularEntityDependencyError as e:
         click.echo(f"ERROR: {e}", err=True)

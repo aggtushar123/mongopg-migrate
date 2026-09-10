@@ -75,7 +75,7 @@ from __future__ import annotations
 import itertools
 import os
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import psycopg
@@ -151,6 +151,7 @@ class EntityLoadResult:
     rows_skipped: int = 0  # documents dropped entirely by an on_missing=skip_row at the entity-field level
     nulled_lookups: dict[str, int] = field(default_factory=dict)  # field path -> count rescued to NULL
     skipped_lookups: dict[str, int] = field(default_factory=dict)  # field path -> count that caused a skip (row/item/junction-row)
+    unprefetched_lookups: list[str] = field(default_factory=list)  # entities too large to hold in memory
 
 
 @dataclass
@@ -583,9 +584,11 @@ def close_external_connections(conns: dict[str, psycopg.Connection]) -> None:
             conn.close()
 
 
-def _mapped_tables(mapping: MappingFile) -> set[str]:
+def _mapped_tables(mapping: MappingFile, *, only: set[str] | None = None) -> set[str]:
     tables: set[str] = set()
-    for entity in mapping.entities.values():
+    for name, entity in mapping.entities.items():
+        if only is not None and name not in only:
+            continue
         tables.add(entity.target)
         tables.update(exp.target for _, exp in _flatten_explode(entity.explode))
         tables.update(junc.target for junc in entity.junction.values())
@@ -593,7 +596,9 @@ def _mapped_tables(mapping: MappingFile) -> set[str]:
     return tables
 
 
-def _truncate_mapped_tables(conn: psycopg.Connection, mapping: MappingFile) -> None:
+def _truncate_mapped_tables(
+    conn: psycopg.Connection, mapping: MappingFile, *, only: set[str] | None = None
+) -> None:
     """Truncate only the tables this mapping actually writes to — all in
     one TRUNCATE statement, which is what Postgres requires: it refuses to
     truncate a table with incoming FKs unless every referencing table is
@@ -602,7 +607,7 @@ def _truncate_mapped_tables(conn: psycopg.Connection, mapping: MappingFile) -> N
     foreign key from an out-of-scope table into a mapped table surfaces as
     a loud error instead of silently deleting data this mapping doesn't own.
     """
-    mapped = sorted(_mapped_tables(mapping))
+    mapped = sorted(_mapped_tables(mapping, only=only))
     if not mapped:
         return
     table_list = ", ".join(f'"{t}"' for t in mapped)
@@ -622,6 +627,8 @@ def _load_entity_batches(
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
     external_conns: dict[str, psycopg.Connection] | None = None,
     uuid_namespace: uuid.UUID = DEFAULT_UUID_NAMESPACE,
+    prefetch_max_rows: int | None = idmap.DEFAULT_PREFETCH_MAX_ROWS,
+    progress: Callable[[str], None] | None = None,
 ) -> EntityLoadResult:
     # Local import: keeps bson out of modules that don't need Mongo types.
     from bson.errors import InvalidId
@@ -707,13 +714,29 @@ def _load_entity_batches(
     # already fully loaded and committed everything this entity looks up, and a
     # self-lookup is a rejected circular dependency — so the map cannot grow
     # underneath us. idmap.put/put_many write through to the snapshot anyway.
+    unprefetched: list[str] = []
     for dep in sorted(entity.lookup_entities()):
         if dep in (external_conns or {}):
             # Cross-database entity: its id_map lives in ITS database, under the
             # standard schema name — same rule _resolve_lookup applies.
-            idmap.prefetch(external_conns[dep], dep, schema=idmap.DEFAULT_SCHEMA_NAME)
+            cached = idmap.prefetch(
+                external_conns[dep], dep, schema=idmap.DEFAULT_SCHEMA_NAME, max_rows=prefetch_max_rows
+            )
         else:
-            idmap.prefetch(conn, dep, schema=internal_schema)
+            cached = idmap.prefetch(conn, dep, schema=internal_schema, max_rows=prefetch_max_rows)
+        if cached < 0:
+            # Too large to hold. `get()` falls back to querying with a bounded
+            # cache in front of it, which is slower but cannot exhaust memory.
+            # Reported rather than silent: on a slow link it is the difference
+            # between a run taking an hour and taking a day, and the operator
+            # can raise the ceiling if the machine has the headroom.
+            unprefetched.append(dep)
+    if unprefetched and progress is not None:
+        progress(
+            f"{entity_name}: id_map for {', '.join(unprefetched)} exceeds the in-memory limit "
+            f"({prefetch_max_rows} rows); looking those up per row instead. "
+            "Raise --idmap-prefetch-max if this machine has the memory."
+        )
 
     cp = checkpoint.get(conn, entity_name, schema=internal_schema)
     was_previously_done = cp is not None and cp.status == "done"
@@ -977,6 +1000,12 @@ def _load_entity_batches(
         conn.commit()
 
         total_rows += len(main_rows)
+        if progress is not None:
+            # After the checkpoint advance, so the number reported is the
+            # number that is actually safe on disk. A long load over a slow
+            # link previously printed nothing at all until an entity finished,
+            # which makes "working" and "hung" look identical.
+            progress(f"  {entity_name}: {total_rows} row(s) loaded so far")
 
     checkpoint.mark_done(conn, entity_name, schema=internal_schema)
     conn.commit()
@@ -988,6 +1017,7 @@ def _load_entity_batches(
         rows_skipped=rows_skipped,
         nulled_lookups=stats.nulled,
         skipped_lookups=stats.skipped,
+        unprefetched_lookups=unprefetched,
     )
 
 
@@ -1003,6 +1033,9 @@ def load(
     target_schema: str = DEFAULT_TARGET_SCHEMA,
     search_path: Sequence[str] | None = None,
     uuid_namespace: uuid.UUID = DEFAULT_UUID_NAMESPACE,
+    prefetch_max_rows: int | None = idmap.DEFAULT_PREFETCH_MAX_ROWS,
+    only: set[str] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> LoadSummary:
     """`target_schema` is the Postgres schema holding the target tables.
 
@@ -1051,10 +1084,25 @@ def load(
             conn.commit()
 
             if mode == "truncate":
-                _truncate_mapped_tables(conn, mapping)
+                _truncate_mapped_tables(conn, mapping, only=only)
                 for entity_name in order:
                     checkpoint.reset(conn, entity_name, schema=internal_schema)
                 conn.commit()
+
+            if only:
+                unknown = sorted(only - set(mapping.entities))
+                if unknown:
+                    raise LoadError(
+                        f"--only names {unknown} which are not entities in this mapping file "
+                        f"(known: {sorted(mapping.entities)})"
+                    )
+                # Order is still derived from the FULL graph, so a selected
+                # entity keeps its place relative to the others; the ones not
+                # selected are simply not run. Their rows must already be
+                # loaded — a `lookup:` into an entity that has never loaded is
+                # refused by _resolve_lookup, which is the check that makes
+                # running a subset safe rather than merely possible.
+                order = [e for e in order if e in only]
 
             summary = LoadSummary(mode=mode)
             for entity_name in order:
@@ -1070,6 +1118,8 @@ def load(
                     internal_schema=internal_schema,
                     external_conns=external_conns,
                     uuid_namespace=uuid_namespace,
+                    prefetch_max_rows=prefetch_max_rows,
+                    progress=progress,
                 )
                 summary.results.append(result)
             return summary

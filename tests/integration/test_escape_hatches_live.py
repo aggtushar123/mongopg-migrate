@@ -69,7 +69,7 @@ def _migrate(mapping_file, mongo_uri, postgres_uri, *extra):
     return CliRunner().invoke(
         main,
         ["migrate", mapping_file, "--mongo-uri", mongo_uri, "--postgres-uri", postgres_uri,
-         "--mode", "truncate", *extra],
+         "--mode", "truncate", "--yes", *extra],
     )
 
 

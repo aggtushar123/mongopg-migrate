@@ -98,7 +98,7 @@ def test_migrate_writes_into_pg_schema_not_public(tmp_path, seeded, pg_conn, mon
             "--mongo-uri", mongo_uri,
             "--postgres-uri", postgres_uri,
             "--pg-schema", SCHEMA,
-            "--mode", "truncate",
+            "--mode", "truncate", "--yes",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -117,7 +117,7 @@ def test_validate_reads_the_same_schema_it_migrated(tmp_path, seeded, pg_conn, m
     migrated = runner.invoke(
         main,
         ["migrate", str(mapping), "--mongo-uri", mongo_uri, "--postgres-uri", postgres_uri,
-         "--pg-schema", SCHEMA, "--mode", "truncate"],
+         "--pg-schema", SCHEMA, "--mode", "truncate", "--yes"],
     )
     assert migrated.exit_code == 0, migrated.output
 
@@ -176,7 +176,7 @@ def test_unknown_pg_schema_is_reported_not_silently_empty(tmp_path, seeded, mong
     result = CliRunner().invoke(
         main,
         ["migrate", str(mapping), "--mongo-uri", mongo_uri, "--postgres-uri", postgres_uri,
-         "--pg-schema", "no_such_schema_here", "--mode", "truncate"],
+         "--pg-schema", "no_such_schema_here", "--mode", "truncate", "--yes"],
     )
     assert result.exit_code != 0
     assert "no_such_schema_here" in result.output

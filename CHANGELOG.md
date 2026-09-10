@@ -11,7 +11,28 @@ under **Changed** with a migration note.
 
 ## [Unreleased]
 
+### Changed
+
+- **`--mode truncate` now asks for confirmation.** It lists the tables it will
+  empty, the schema and the server, and defaults to no. **Scripts that ran
+  `--mode truncate` non-interactively must add `--yes`.** `append` and `upsert`
+  are unaffected.
+
 ### Added
+
+- `--only <entity>` (repeatable) to run part of a mapping, for a phased
+  cutover. `truncate` is scoped to the selection, so running one entity cannot
+  empty another's tables.
+- Progress output during a load, throttled to one line every few seconds. A
+  long run previously printed nothing until an entity finished, which makes
+  "working" and "hung" look identical.
+- `--idmap-prefetch-max` (default 2,000,000), a ceiling on id_map rows held in
+  memory per referenced entity. The prefetch that made loads fast enough for a
+  slow link was unbounded: at ~200 bytes a row that is ~1.2 GB at 5M rows and
+  ~12 GB at 50M, allocated before the first document is processed. It was never
+  hit in development because the largest entity there was ~65k rows. Above the
+  cap, lookups go per row with a bounded cache in front — slower, but it cannot
+  exhaust memory, and the run says so rather than failing silently.
 
 - `--internal-schema` and `--uuid-namespace`. Both were parameterised in code
   and unreachable from outside it. The first renames the schema holding

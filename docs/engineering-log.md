@@ -294,7 +294,7 @@ CI-proven: `tests/test_depends_on.py` (14), covering ordering, union with lookup
 
 ## id_map bulk `prefetch()` + batched `put_many()`: `get()` was one network round trip per `lookup:` per row, which over a VPN set the pace for the whole migration
 
-**Automated (CI)** — `test_idmap_prefetch.py` (21)
+**Automated (CI)** — `test_idmap_prefetch.py` (31)
 
 The two subtlest behaviours were mutation-checked.
 

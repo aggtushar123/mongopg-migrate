@@ -19,7 +19,7 @@ reference PRD section numbers throughout.
 **Alpha.** The core loop — `introspect` → `propose` → `validate-mapping` →
 `dry-run` → `migrate` → `validate` — works end to end and is exercised on
 every push against real MongoDB and PostgreSQL containers: over 340 unit
-tests and 30 live integration tests.
+tests and 42 live integration tests.
 
 It has been used for one large real migration, which is where most of its
 sharp edges came from. It has not been used by anyone else yet, so
@@ -44,6 +44,7 @@ target schema before you trust it with anything you cannot rebuild.
 | `--mode upsert` — staging table + `ON CONFLICT` | `test_load_upsert.py` (4), `integration/test_upsert_live.py` (6) |
 | `--internal-schema` and `--uuid-namespace` escape hatches | `test_connerrors.py` (19), `integration/test_escape_hatches_live.py` (10) |
 | `validate` count-diff correctness (shared targets, skip_row rows, skipped children, numeric scale) | `test_validate_countdiff.py` (28) |
+| Operational safety — `truncate` confirmation, `--only` subset, progress output | `integration/test_operational_live.py` (12) |
 | Docker image | ⚠️ hand-verified; built multi-arch by `release.yml`, but no test asserts it behaves |
 | `append`/`upsert` resuming an entity already marked `done` | `integration/test_resume_done_entity_live.py` (8) |
 
@@ -258,6 +259,30 @@ A `|` inside an `enum:` JSON object is not a step separator, so
 `enum:{"A|B": "both"}` works. The one case the syntax cannot express is
 `split:` on a literal pipe *combined with other steps* — `split:|` alone is
 fine, `trim|split:|` is ambiguous and says so.
+
+### Running it on something you care about
+
+- **`--mode truncate` asks first.** It lists the tables it will empty, the
+  schema, and the server (password masked), and defaults to no. Pass `--yes`
+  for automation — scripts that ran `--mode truncate` non-interactively before
+  v0.1.2 need it added. `append` and `upsert` are not gated; prompting on
+  non-destructive modes only teaches people to hit `y` without reading.
+- **`--only <entity>`** (repeatable) runs part of a mapping, for a phased
+  cutover. Load order still comes from the full graph, so a selected entity
+  keeps its place. `truncate` is scoped to the selection too — it will not
+  empty tables this run is not going to reload. An entity a run depends on
+  must already be loaded; a `lookup:` into one that has never loaded is
+  refused, which is what makes running a subset safe rather than merely
+  possible.
+- **Progress is reported** while an entity loads, at most one line every few
+  seconds, so a long run over a slow link is distinguishable from a hung one.
+- **`--idmap-prefetch-max`** (default 2,000,000) caps how many id_map rows are
+  held in memory per referenced entity. The snapshot is roughly 200 bytes a
+  row, so an unbounded prefetch is a memory ceiling waiting for a big enough
+  source — about 12 GB for a 50M-row entity, before the first document is
+  processed. Above the cap the entity is looked up per row instead, with a
+  bounded cache in front; the run says so and names the flag. Slower, but it
+  cannot exhaust memory.
 
 ### Fitting an existing environment
 

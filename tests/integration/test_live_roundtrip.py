@@ -162,7 +162,7 @@ def test_full_pipeline_against_real_mongo_and_postgres(seeded, mongo_uri, postgr
     assert result.exit_code == 0, result.output
     assert "no violations" in result.output
 
-    result = _run(["migrate", str(mapping_path), "--mode", "truncate"], mongo_uri, postgres_uri)
+    result = _run(["migrate", str(mapping_path), "--mode", "truncate", "--yes"], mongo_uri, postgres_uri)
     assert result.exit_code == 0, result.output
 
     result = _run(["validate", str(mapping_path)], mongo_uri, postgres_uri)

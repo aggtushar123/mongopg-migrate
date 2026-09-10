@@ -23,6 +23,7 @@ from mongopg_migrate.migrate import idmap
 class _FakeCursor:
     def __init__(self, conn):
         self.conn = conn
+        self.last = ""
 
     def __enter__(self):
         return self
@@ -31,12 +32,17 @@ class _FakeCursor:
         return False
 
     def execute(self, sql, params=None):
+        self.last = str(sql)
         self.conn.statements.append((str(sql), params))
 
     def fetchall(self):
         return self.conn.rows
 
     def fetchone(self):
+        # prefetch() asks for the row count before deciding to cache anything,
+        # so the fake has to answer that separately from a row lookup.
+        if "count(*)" in self.last:
+            return (len(self.conn.rows),)
         return self.conn.rows[0] if self.conn.rows else None
 
 
@@ -75,9 +81,18 @@ def test_prefetch_reports_how_many_rows_it_cached():
     assert idmap.is_prefetched(conn, "users")
 
 
-def test_prefetch_reads_the_whole_entity_in_one_statement():
+def test_prefetch_costs_a_fixed_number_of_statements_regardless_of_size():
+    # A count to decide whether the entity fits in memory, then one fetch.
+    # What matters is that it is O(1) per entity rather than O(1) per row.
     conn = _FakeConn(rows=[("a", "1")])
     idmap.prefetch(conn, "users")
+    assert len(conn.selects) == 2
+    assert "count(*)" in conn.selects[0]
+
+
+def test_prefetch_can_skip_the_count_when_the_caller_opts_out_of_the_bound():
+    conn = _FakeConn(rows=[("a", "1")])
+    assert idmap.prefetch(conn, "users", max_rows=None) == 1
     assert len(conn.selects) == 1
 
 
@@ -248,3 +263,88 @@ def test_dedup_is_scoped_per_entity_not_per_source_id():
     idmap.put_many(conn, [("users", "a", "u"), ("orders", "a", "o")])
     _, params = conn.statements[0]
     assert len(params) == 6
+
+
+# ── the memory bound ─────────────────────────────────────────────────────────
+# The snapshot is ~200 bytes per row and an entity that looks up several
+# others holds several at once, so an unbounded prefetch is a memory blowup
+# waiting for a big enough source: ~1.2 GB at 5M rows, ~12 GB at 50M. It was
+# never hit in development because the largest entity there was ~65k rows.
+
+
+def test_an_entity_over_the_limit_is_not_cached():
+    conn = _FakeConn(rows=[(str(i), f"u{i}") for i in range(10)])
+    assert idmap.prefetch(conn, "users", max_rows=5) == -1
+    assert not idmap.is_prefetched(conn, "users")
+
+
+def test_an_oversized_entity_costs_only_the_count_query():
+    # The rows must never be fetched to discover there are too many of them —
+    # that is precisely the allocation being avoided.
+    conn = _FakeConn(rows=[(str(i), f"u{i}") for i in range(10)])
+    idmap.prefetch(conn, "users", max_rows=5)
+    assert len(conn.selects) == 1
+    assert "count(*)" in conn.selects[0]
+
+
+def test_an_entity_exactly_at_the_limit_is_still_cached():
+    conn = _FakeConn(rows=[(str(i), f"u{i}") for i in range(5)])
+    assert idmap.prefetch(conn, "users", max_rows=5) == 5
+    assert idmap.is_prefetched(conn, "users")
+
+
+def test_the_default_limit_is_documented_and_finite():
+    assert isinstance(idmap.DEFAULT_PREFETCH_MAX_ROWS, int)
+    assert idmap.DEFAULT_PREFETCH_MAX_ROWS > 0
+
+
+# ── the fallback cache ───────────────────────────────────────────────────────
+# Bounded, and deliberately NOT authoritative: entries exist only for rows
+# that were found, so a miss means "not cached", never "not present".
+
+
+def test_a_repeated_lookup_is_served_from_the_fallback_cache():
+    conn = _FakeConn(rows=[("uuid-1",)])
+    assert idmap.get(conn, "users", "a") == "uuid-1"
+    before = len(conn.selects)
+    assert idmap.get(conn, "users", "a") == "uuid-1"
+    assert len(conn.selects) == before, "the second lookup queried again"
+
+
+def test_a_miss_is_never_cached_and_always_re_queries():
+    """The correctness rule the whole fallback depends on.
+
+    Caching absence would make `on_missing` fire on rows that are perfectly
+    fine — the row simply had not been written when it was first asked for.
+    """
+    conn = _FakeConn(rows=[])
+    assert idmap.get(conn, "users", "ghost") is None
+    conn.rows = [("uuid-9",)]
+    assert idmap.get(conn, "users", "ghost") == "uuid-9"
+
+
+def test_the_fallback_cache_does_not_grow_without_bound():
+    idmap.set_fallback_cache_size(4)
+    try:
+        conn = _FakeConn(rows=[("uuid-x",)])
+        for i in range(50):
+            idmap.get(conn, "users", f"k{i}")
+        held = idmap._FALLBACK.get(conn, {}).get(("_mongopg", "users"), {})
+        assert len(held) <= 4
+    finally:
+        idmap.set_fallback_cache_size(idmap.DEFAULT_FALLBACK_CACHE_SIZE)
+
+
+def test_a_snapshot_still_wins_over_the_fallback_cache():
+    conn = _FakeConn(rows=[("a", "snap")])
+    idmap.prefetch(conn, "users")
+    before = len(conn.selects)
+    assert idmap.get(conn, "users", "a") == "snap"
+    assert len(conn.selects) == before
+
+
+def test_clear_prefetch_drops_the_fallback_cache_too():
+    conn = _FakeConn(rows=[("uuid-1",)])
+    idmap.get(conn, "users", "a")
+    idmap.clear_prefetch(conn)
+    assert conn not in idmap._FALLBACK
