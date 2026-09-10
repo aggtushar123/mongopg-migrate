@@ -95,6 +95,7 @@ from mongopg_migrate.mapping.schema import (
     UnpivotItem,
 )
 from mongopg_migrate.migrate import checkpoint, idmap
+from mongopg_migrate.migrate.idstrategy import NAMESPACE as DEFAULT_UUID_NAMESPACE
 from mongopg_migrate.migrate.idstrategy import resolve_new_id
 from mongopg_migrate.migrate.transform import apply_default, apply_transform, get_nested, json_safe
 
@@ -228,6 +229,7 @@ def _collect_explode_rows(
     external_conns: dict[str, psycopg.Connection] | None,
     stats: OnMissingStats | None = None,
     unloaded_entity_cache: dict[str, bool] | None = None,
+    uuid_namespace: uuid.UUID = DEFAULT_UUID_NAMESPACE,
 ) -> None:
     """Builds this level's rows for one parent document's array, recursing
     into any nested `explode` children. Only a level WITH nested children
@@ -263,6 +265,7 @@ def _collect_explode_rows(
                     conn=conn,
                     column_default=id_col_default,
                     id_buffer=id_buffers.setdefault(path, {}),
+                    namespace=uuid_namespace,
                 )
                 own_id_value = resolved.column_value
                 row.append(own_id_value)
@@ -305,6 +308,7 @@ def _collect_explode_rows(
                 unloaded_entity_cache=unloaded_entity_cache,
                 internal_schema=internal_schema,
                 external_conns=external_conns,
+                uuid_namespace=uuid_namespace,
             )
 
 
@@ -617,6 +621,7 @@ def _load_entity_batches(
     mode: str = "append",
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
     external_conns: dict[str, psycopg.Connection] | None = None,
+    uuid_namespace: uuid.UUID = DEFAULT_UUID_NAMESPACE,
 ) -> EntityLoadResult:
     # Local import: keeps bson out of modules that don't need Mongo types.
     from bson.errors import InvalidId
@@ -714,6 +719,32 @@ def _load_entity_batches(
     was_previously_done = cp is not None and cp.status == "done"
     resume_from = cp.last_source_id if cp else None
 
+    # Refuse to continue a migration under a DIFFERENT uuid namespace than the
+    # one that produced the rows already loaded.
+    #
+    # `--uuid-namespace` exists so an organisation can reproduce ids minted by
+    # an earlier cutover. Changing it midway through one migration is the
+    # dangerous shape of the same flag: every document would resolve to a new
+    # UUID, so a resume would insert a second copy of every row rather than
+    # continue, and no foreign key would point where it used to. Nothing else
+    # would complain — the load succeeds, and only a later count diff shows
+    # the duplication.
+    #
+    # One indexed lookup, once per entity, comparing what the id_map already
+    # stores for the checkpointed document against what this run would derive.
+    if resume_from is not None and entity.id_strategy.type is IdStrategyType.OBJECTID_TO_UUID:
+        recorded = idmap.get(conn, entity_name, str(resume_from), schema=internal_schema)
+        expected = str(uuid.uuid5(uuid_namespace, str(resume_from)))
+        if recorded is not None and recorded != expected:
+            raise LoadError(
+                f"{entity_name}: this migration's existing rows were generated under a different "
+                f"uuid namespace. Source document _id={resume_from!r} is recorded in "
+                f"{internal_schema}.id_map as {recorded}, but --uuid-namespace={uuid_namespace} "
+                f"derives {expected}. Resuming would insert a duplicate of every row rather than "
+                "continue. Re-run with the namespace the earlier rows were created with, or start "
+                "the entity over (--mode truncate, or clear its checkpoint and id_map rows)."
+            )
+
     query: dict = dict(entity.mongo_filter())
     if resume_from:
         try:
@@ -784,7 +815,8 @@ def _load_entity_batches(
                     "the entity."
                 )
             resolved = resolve_new_id(
-                entity.id_strategy, identity_value, conn=conn, column_default=id_col_default, id_buffer=id_buffer
+                entity.id_strategy, identity_value, conn=conn, column_default=id_col_default,
+                id_buffer=id_buffer, namespace=uuid_namespace,
             )
 
             # Everything for this one document is built into LOCAL
@@ -835,6 +867,7 @@ def _load_entity_batches(
                         external_conns=external_conns,
                         stats=stats,
                         unloaded_entity_cache=unloaded_entity_cache,
+                        uuid_namespace=uuid_namespace,
                     )
 
                 doc_junction_rows: dict[str, list[tuple]] = {k: [] for k in junction_columns}
@@ -969,6 +1002,7 @@ def load(
     internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
     target_schema: str = DEFAULT_TARGET_SCHEMA,
     search_path: Sequence[str] | None = None,
+    uuid_namespace: uuid.UUID = DEFAULT_UUID_NAMESPACE,
 ) -> LoadSummary:
     """`target_schema` is the Postgres schema holding the target tables.
 
@@ -1035,6 +1069,7 @@ def load(
                     mode=mode,
                     internal_schema=internal_schema,
                     external_conns=external_conns,
+                    uuid_namespace=uuid_namespace,
                 )
                 summary.results.append(result)
             return summary

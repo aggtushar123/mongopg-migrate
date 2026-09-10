@@ -70,9 +70,24 @@ def resolve_new_id(
     column_default: str | None = None,
     id_buffer: dict[str, list[int]] | None = None,
     reserve_block_size: int = DEFAULT_RESERVE_BLOCK_SIZE,
+    namespace: uuid.UUID = NAMESPACE,
 ) -> ResolvedId:
+    """`namespace` overrides the uuid5 namespace for `objectid_to_uuid`.
+
+    It exists for one case: an organisation that already minted
+    ObjectId-derived UUIDs in an earlier cutover, under a namespace of its
+    own. Without an override those values can never be reproduced and every
+    foreign key to previously-migrated data is wrong, with no workaround
+    short of editing installed source.
+
+    Changing it between runs of the SAME migration is the dangerous move —
+    the same document would resolve to a different UUID, so a resume would
+    insert duplicates rather than continue. migrate/load.py checks the stored
+    id_map against the namespace in use before resuming, and refuses on a
+    mismatch.
+    """
     if strategy.type == IdStrategyType.OBJECTID_TO_UUID:
-        target = uuid.uuid5(NAMESPACE, str(source_id))
+        target = uuid.uuid5(namespace, str(source_id))
         return ResolvedId(column_value=target, str_form=str(target))
 
     if strategy.type == IdStrategyType.PASSTHROUGH:

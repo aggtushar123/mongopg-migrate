@@ -19,7 +19,7 @@ reference PRD section numbers throughout.
 **Alpha.** The core loop — `introspect` → `propose` → `validate-mapping` →
 `dry-run` → `migrate` → `validate` — works end to end and is exercised on
 every push against real MongoDB and PostgreSQL containers: over 340 unit
-tests and 20 live integration tests.
+tests and 30 live integration tests.
 
 It has been used for one large real migration, which is where most of its
 sharp edges came from. It has not been used by anyone else yet, so
@@ -42,6 +42,8 @@ target schema before you trust it with anything you cannot rebuild.
 | `--pg-schema` honoured on read **and** write | `test_target_schema.py` (11) + live (4) |
 | `mongopg-fanin` — the fan-in (N docs → 1 row) helper | `test_fanin_reshape.py` (21); `$merge` path hand-verified |
 | `--mode upsert` — staging table + `ON CONFLICT` | `test_load_upsert.py` (4), `integration/test_upsert_live.py` (6) |
+| `--internal-schema` and `--uuid-namespace` escape hatches | `test_connerrors.py` (19), `integration/test_escape_hatches_live.py` (10) |
+| `validate` count-diff correctness (shared targets, skip_row rows, skipped children, numeric scale) | `test_validate_countdiff.py` (28) |
 | Docker image | ⚠️ hand-verified; built multi-arch by `release.yml`, but no test asserts it behaves |
 | `append`/`upsert` resuming an entity already marked `done` | `integration/test_resume_done_entity_live.py` (8) |
 
@@ -256,6 +258,33 @@ A `|` inside an `enum:` JSON object is not a step separator, so
 `enum:{"A|B": "both"}` works. The one case the syntax cannot express is
 `split:` on a literal pipe *combined with other steps* — `split:|` alone is
 fine, `trim|split:|` is ambiguous and says so.
+
+### Fitting an existing environment
+
+Two escape hatches for targets that cannot take the defaults. Both must be
+passed identically to every command in a migration.
+
+**`--internal-schema`** (default `_mongopg`) renames the schema holding this
+tool's own `id_map` and `load_checkpoint` tables — for a target whose owner
+will not grant a schema by that name. `validate` run against the wrong one
+says so rather than reporting a clean pass.
+
+**`--uuid-namespace`** overrides the uuid5 namespace behind the
+`objectid_to_uuid` id strategy. Override it **only** to reproduce ids minted
+by an earlier cutover under a namespace of its own; otherwise every foreign
+key to that previously-migrated data would point somewhere new.
+
+```bash
+mongopg-migrate migrate mapping.yaml \
+  --internal-schema app_migration \
+  --uuid-namespace 11111111-2222-4333-8444-555555555555 ...
+```
+
+Changing the namespace partway through a migration is refused: the same
+document would resolve to a different UUID, so a resume would insert a second
+copy of every row instead of continuing. Before resuming, the loader compares
+what the id_map already stores against what the current namespace derives,
+and stops if they disagree.
 
 ### Re-running a migration
 

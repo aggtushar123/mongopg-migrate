@@ -60,6 +60,7 @@ from mongopg_migrate.mapping.schema import (
 from mongopg_migrate.migrate import idmap
 from mongopg_migrate.migrate.load import (
     DEFAULT_TARGET_SCHEMA,
+    DEFAULT_UUID_NAMESPACE,
     LoadError,
     close_external_connections,
     open_external_connections,
@@ -495,6 +496,7 @@ def run_fast_pass(
     batch_size: int = DEFAULT_BATCH_SIZE,
     sample_size: int | None = None,
     max_violations: int = DEFAULT_MAX_VIOLATIONS,
+    internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
 ) -> DryRunReport:
     """`postgres_dsn` is optional and read-only when given: it's only used
     to check `_mongopg.id_map` for `lookup:`s that name an `external_entities`
@@ -531,7 +533,10 @@ def run_fast_pass(
                     break
 
                 needs = _collect_batch_lookup_needs(batch, entity)
-                found = _check_existence(db, mapping, needs, conn=pg_conn, external_conns=external_conns)
+                found = _check_existence(
+                    db, mapping, needs, conn=pg_conn, external_conns=external_conns,
+                    internal_schema=internal_schema,
+                )
 
                 for doc in batch:
                     violations.extend(_validate_id_strategy(doc, entity, entity_name))
@@ -695,8 +700,12 @@ def run_realistic_pass(
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     target_schema: str = DEFAULT_TARGET_SCHEMA,
+    internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
+    uuid_namespace: uuid.UUID = DEFAULT_UUID_NAMESPACE,
 ) -> DryRunReport:
-    internal_schema = f"_mongopg_dryrun_{uuid.uuid4().hex[:10]}"
+    # The dry run's OWN internal schema is always disposable and uniquely
+    # named; `internal_schema` names the REAL one it seeds reference rows from.
+    dryrun_schema = f"_mongopg_dryrun_{uuid.uuid4().hex[:10]}"
     violations: list[DryRunViolation] = []
 
     with psycopg.connect(postgres_dsn) as setup_conn:
@@ -712,8 +721,8 @@ def run_realistic_pass(
             # The disposable id_map must start holding the reference rows the
             # real run will see (external_entities seeded by hand), or every
             # such lookup reports a false miss. See _seed_external_id_map.
-            idmap.ensure_schema(setup_conn, schema=internal_schema)
-            _seed_external_id_map(setup_conn, mapping, internal_schema)
+            idmap.ensure_schema(setup_conn, schema=dryrun_schema)
+            _seed_external_id_map(setup_conn, mapping, dryrun_schema, source_schema=internal_schema)
 
             # The clone first, then the real target schema — NOT a literal
             # `public`, which silently ignored --pg-schema.
@@ -725,8 +734,9 @@ def run_realistic_pass(
                 pg_schema,
                 mode="truncate",
                 batch_size=batch_size,
-                internal_schema=internal_schema,
+                internal_schema=dryrun_schema,
                 search_path=search_path,
+                uuid_namespace=uuid_namespace,
             )
         except (LoadError, CircularEntityDependencyError) as e:
             violations.append(DryRunViolation(entity="<realistic load>", layer="realistic", field=None, message=str(e)))
@@ -735,7 +745,7 @@ def run_realistic_pass(
                 DryRunViolation(entity="<realistic load>", layer="realistic", field=None, message=f"Postgres error: {e}")
             )
         finally:
-            _drop_dryrun_artifacts(setup_conn, temp_schema, internal_schema)
+            _drop_dryrun_artifacts(setup_conn, temp_schema, dryrun_schema)
 
     return DryRunReport(violations=violations)
 
@@ -753,17 +763,22 @@ def run(
     sample_size: int | None = None,
     force_realistic: bool = False,
     target_schema: str = DEFAULT_TARGET_SCHEMA,
+    internal_schema: str = idmap.DEFAULT_SCHEMA_NAME,
+    uuid_namespace: uuid.UUID = DEFAULT_UUID_NAMESPACE,
 ) -> DryRunReport:
     """Runs Layer A always; runs Layer B only if Layer A found nothing (or
     `force_realistic=True`) — no point paying for a real COPY+FK pass
     against a mapping that's already known to fail. PRD §6 step 5: "Report
     combines both."""
     report = run_fast_pass(
-        mapping, mongo_uri, pg_schema, postgres_dsn=postgres_dsn, batch_size=batch_size, sample_size=sample_size
+        mapping, mongo_uri, pg_schema, postgres_dsn=postgres_dsn, batch_size=batch_size,
+        sample_size=sample_size, internal_schema=internal_schema,
     )
     if report.ok or force_realistic:
         realistic = run_realistic_pass(
-            mapping, mongo_uri, postgres_dsn, pg_schema, batch_size=batch_size, target_schema=target_schema
+            mapping, mongo_uri, postgres_dsn, pg_schema, batch_size=batch_size,
+            target_schema=target_schema, internal_schema=internal_schema,
+            uuid_namespace=uuid_namespace,
         )
         report.violations.extend(realistic.violations)
     return report

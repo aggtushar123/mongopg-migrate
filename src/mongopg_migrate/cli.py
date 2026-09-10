@@ -16,10 +16,12 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 
 import click
 import psycopg
 
+from mongopg_migrate.connerrors import friendly_connection_errors
 from mongopg_migrate.introspect.mongo import (
     introspect_database,
     introspect_entities,
@@ -47,8 +49,8 @@ from mongopg_migrate.mapping.schema import (
     validate_explode_field_coverage,
     validate_structure,
 )
-from mongopg_migrate.migrate import dryrun
-from mongopg_migrate.migrate.load import LoadError
+from mongopg_migrate.migrate import dryrun, idmap
+from mongopg_migrate.migrate.load import DEFAULT_UUID_NAMESPACE, LoadError
 from mongopg_migrate.migrate.load import load as run_load
 from mongopg_migrate.report.validate import ValidationError
 from mongopg_migrate.report.validate import validate as run_validate
@@ -87,6 +89,7 @@ def main() -> None:
 @POSTGRES_URI_OPTION
 @click.option("--sample-size", type=int, default=None, help="Override the sampling heuristic (PRD §10).")
 @click.option("--pg-schema", default="public", help="Postgres schema to introspect.")
+@friendly_connection_errors
 def introspect_cmd(mongo_uri: str, postgres_uri: str, sample_size: int | None, pg_schema: str) -> None:
     """Sample Mongo collections and read the Postgres target schema; print
     a JSON summary of both (PRD §6 step 2)."""
@@ -180,6 +183,7 @@ def introspect_cmd(mongo_uri: str, postgres_uri: str, sample_size: int | None, p
     "ANTHROPIC_API_KEY / `ant auth login` itself — this flag only overrides that); OPENAI_API_KEY "
     "for openai-compatible. Many local servers (Ollama, LM Studio) need no key — leave unset.",
 )
+@friendly_connection_errors
 def propose_cmd(
     mongo_uri: str,
     postgres_uri: str,
@@ -251,6 +255,7 @@ def propose_cmd(
 @click.argument("mapping_path")
 @click.option("--mongo-uri", envvar="MONGO_URI", default=None, help="If given, also checks the P0 unmapped-field policy against live Mongo schema.")
 @click.option("--sample-size", type=int, default=None)
+@friendly_connection_errors
 def validate_mapping_cmd(mapping_path: str, mongo_uri: str | None, sample_size: int | None) -> None:
     """Validate a mapping file: structure (PRD §12) always; the P0
     unmapped-field policy (PRD §7) too, if --mongo-uri is given."""
@@ -313,6 +318,23 @@ def validate_mapping_cmd(mapping_path: str, mongo_uri: str | None, sample_size: 
     default=None,
     help="Force Layer B on/off. Default: run it only if Layer A found nothing (see migrate/dryrun.py:run).",
 )
+@click.option(
+    "--internal-schema",
+    default=idmap.DEFAULT_SCHEMA_NAME,
+    show_default=True,
+    help="Schema for this tool's own id_map/checkpoint tables. Must be the same across "
+    "every command in a migration, or resume and validate will not find their state.",
+)
+@click.option(
+    "--uuid-namespace",
+    type=click.UUID,
+    default=str(DEFAULT_UUID_NAMESPACE),
+    show_default=True,
+    help="uuid5 namespace for the objectid_to_uuid id strategy. Override ONLY to reproduce "
+    "ids minted by an earlier cutover under a different namespace. It must not change "
+    "partway through a migration; a resume under a different one is refused.",
+)
+@friendly_connection_errors
 def dry_run_cmd(
     mapping_path: str,
     mongo_uri: str,
@@ -321,6 +343,8 @@ def dry_run_cmd(
     batch_size: int,
     sample_size: int | None,
     realistic: bool | None,
+    internal_schema: str,
+    uuid_namespace: uuid.UUID,
 ) -> None:
     """PRD §6 step 5: in-memory type/null/lookup validation (Layer A),
     optionally followed by a real COPY+FK load into a disposable schema
@@ -342,21 +366,25 @@ def dry_run_cmd(
         if realistic is None:
             report = dryrun.run(
                 mapping, mongo_uri, postgres_uri, pg, batch_size=batch_size, sample_size=sample_size,
-                target_schema=pg_schema,
+                target_schema=pg_schema, internal_schema=internal_schema,
+                uuid_namespace=uuid_namespace,
             )
         elif realistic:
             click.echo("Running Layer A (fast pass)...", err=True)
             report = dryrun.run_fast_pass(
-                mapping, mongo_uri, pg, postgres_dsn=postgres_uri, batch_size=batch_size, sample_size=sample_size
+                mapping, mongo_uri, pg, postgres_dsn=postgres_uri, batch_size=batch_size,
+                sample_size=sample_size, internal_schema=internal_schema,
             )
             click.echo("Running Layer B (realistic pass, disposable schema clone)...", err=True)
             realistic_report = dryrun.run_realistic_pass(
-                mapping, mongo_uri, postgres_uri, pg, batch_size=batch_size, target_schema=pg_schema
+                mapping, mongo_uri, postgres_uri, pg, batch_size=batch_size, target_schema=pg_schema,
+                internal_schema=internal_schema,
             )
             report.violations.extend(realistic_report.violations)
         else:
             report = dryrun.run_fast_pass(
-                mapping, mongo_uri, pg, postgres_dsn=postgres_uri, batch_size=batch_size, sample_size=sample_size
+                mapping, mongo_uri, pg, postgres_dsn=postgres_uri, batch_size=batch_size,
+                sample_size=sample_size, internal_schema=internal_schema,
             )
     except CircularEntityDependencyError as e:
         click.echo(f"ERROR: {e}", err=True)
@@ -404,8 +432,26 @@ def dry_run_cmd(
 )
 @click.option("--pg-schema", default="public", help="Postgres schema holding the target tables.")
 @click.option("--batch-size", type=int, default=500)
+@click.option(
+    "--internal-schema",
+    default=idmap.DEFAULT_SCHEMA_NAME,
+    show_default=True,
+    help="Schema for this tool's own id_map/checkpoint tables. Must be the same across "
+    "every command in a migration, or resume and validate will not find their state.",
+)
+@click.option(
+    "--uuid-namespace",
+    type=click.UUID,
+    default=str(DEFAULT_UUID_NAMESPACE),
+    show_default=True,
+    help="uuid5 namespace for the objectid_to_uuid id strategy. Override ONLY to reproduce "
+    "ids minted by an earlier cutover under a different namespace. It must not change "
+    "partway through a migration; a resume under a different one is refused.",
+)
+@friendly_connection_errors
 def migrate_cmd(
-    mapping_path: str, mongo_uri: str, postgres_uri: str, mode: str, pg_schema: str, batch_size: int
+    mapping_path: str, mongo_uri: str, postgres_uri: str, mode: str, pg_schema: str,
+    batch_size: int, internal_schema: str, uuid_namespace: uuid.UUID,
 ) -> None:
     """PRD §6 step 6: FK/lookup-ordered COPY + `_mongopg.id_map` + per-batch
     checkpoint/resume. Re-running after a kill resumes automatically."""
@@ -436,7 +482,9 @@ def migrate_cmd(
 
     try:
         summary = run_load(
-            mapping, mongo_uri, postgres_uri, pg, mode=mode, batch_size=batch_size, target_schema=pg_schema
+            mapping, mongo_uri, postgres_uri, pg, mode=mode, batch_size=batch_size,
+            target_schema=pg_schema, internal_schema=internal_schema,
+            uuid_namespace=uuid_namespace,
         )
     except CircularEntityDependencyError as e:
         click.echo(f"ERROR: {e}", err=True)
@@ -521,8 +569,17 @@ def migrate_cmd(
     default=200,
     help="Random rows per entity to re-derive and value-diff against the loaded row (PRD §9).",
 )
+@click.option(
+    "--internal-schema",
+    default=idmap.DEFAULT_SCHEMA_NAME,
+    show_default=True,
+    help="Schema for this tool's own id_map/checkpoint tables. Must be the same across "
+    "every command in a migration, or resume and validate will not find their state.",
+)
+@friendly_connection_errors
 def validate_cmd(
-    mapping_path: str, mongo_uri: str, postgres_uri: str, pg_schema: str, sample_size: int
+    mapping_path: str, mongo_uri: str, postgres_uri: str, pg_schema: str, sample_size: int,
+    internal_schema: str,
 ) -> None:
     """PRD §6 step 7: post-migration count diff (incl. explode/junction
     child tables) plus a hashed-field sample diff — row counts matching is
@@ -535,7 +592,8 @@ def validate_cmd(
 
     try:
         report = run_validate(
-            mapping, mongo_uri, postgres_uri, pg, sample_size=sample_size, target_schema=pg_schema
+            mapping, mongo_uri, postgres_uri, pg, sample_size=sample_size, target_schema=pg_schema,
+            internal_schema=internal_schema,
         )
     except ValidationError as e:
         click.echo(f"ERROR: {e}", err=True)

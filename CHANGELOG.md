@@ -11,6 +11,31 @@ under **Changed** with a migration note.
 
 ## [Unreleased]
 
+### Added
+
+- `--internal-schema` and `--uuid-namespace`. Both were parameterised in code
+  and unreachable from outside it. The first renames the schema holding
+  `id_map`/`load_checkpoint`, for a target whose owner will not grant
+  `_mongopg`. The second overrides the uuid5 namespace behind
+  `objectid_to_uuid`, so an organisation that minted ObjectId-derived UUIDs in
+  an earlier cutover can reproduce them — previously impossible without editing
+  installed source. Changing the namespace partway through a migration is
+  refused, because a resume under a different one would insert a second copy of
+  every row rather than continue.
+- Tests for `validate`'s count-diff correctness
+  (`tests/test_validate_countdiff.py`, 28) — the four fixes that stop a correct
+  migration being reported as failed, and the newest logic in the safety net,
+  had no direct tests at all.
+
+### Fixed
+
+- A failed database connection printed a raw stack trace — a pymongo topology
+  dump or psycopg's duplicated IPv6/IPv4 refusal — rather than a message. It is
+  the most likely first error after `pip install`, and the only path in the CLI
+  that was not reported properly. It now names which database, echoes the URI
+  used (with any password masked), gives the reason without the dump, and
+  suggests what to check.
+
 ## [0.1.1] — 2026-09-10
 
 First published release. `0.1.0` existed in `pyproject.toml` but was never
