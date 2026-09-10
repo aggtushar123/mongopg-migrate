@@ -43,7 +43,7 @@ Early, pre-alpha. Implemented so far:
 | `cast_bool`/`cast_text` array safety: found live re-verifying a transcript's "arrays of plain scalars" note (already resolved — see the `enum:`/`split:` row above — but re-checking it directly, rather than trusting the earlier note, surfaced this) — `bool(some_list)` is `True` for any non-empty list and `False` for an empty one (Python truthiness, not a real cast), and `str(some_list)` silently lands the Python repr `'[1, 2, 3]'` in a text column; neither raised. `cast_int`/`cast_float` already rejected a list on their own (`int()`/`float()` naturally do); `enum:`/`split:` already raised loudly too — only `cast_bool`/`cast_text` were quietly wrong, same footgun class as the character-by-character scalar-iteration bug above | ✅ — 5 regression tests; live-tested: a `flags: ["a", "b"]` field mapped with `transform: cast_bool` now fails dry-run with a clear message instead of silently landing `is_active = true` |
 | `unpivot:` construct (PRD §7 P0, worked example §12.2): N differently-named top-level scalar fields (e.g. `pfAmount`/`payToHospital`/`finalBill`) → N rows in an existing child table, each carrying a literal `code` — the EAV/pivot-normalization shape neither `explode` (one array, repeated shape) nor `junction` (one array of scalar FKs) can express. Natural key `(parent_fk, code)` makes `--mode upsert` genuinely meaningful (unlike `explode` children) | ✅ — live-tested: mixed presence/absence/explicit-null across 3 documents produced exactly the expected 5 rows (`skip_null` respected), re-running in upsert mode updated one row's value in place with zero duplicates; count-diff (`bookings_test.amounts: mongo=5 postgres=5`) and dry-run Layer A (transform errors + NOT NULL, respecting `skip_null`) both cover it |
 | Nested `explode:` (PRD §7 P0, worked example §12.1) — a second embedded array one level down (e.g. `hospitalDetails.facilities[].categoryParts[]` → a `HospitalFacility` row per facility, each with its own `FacilityCategoryPart` child rows). A middle level's own id is resolved *before* its row is COPYed (`resolve_new_id`, previously called only for the top-level entity) so it can be threaded down as the nested level's `parent_fk` — `explode.id_strategy` was a validated-but-unread field before this; `serial` is now rejected on any level that has nested children, since a SERIAL value isn't known until after INSERT and COPY has no RETURNING | ✅ — live-tested: 2 hospitals / 3 facilities / 3 category-parts loaded with correct FK threading at both levels (verified by joining all three tables back together), a facility with no `categoryParts` at all produced zero grandchild rows, a scalar-where-array-expected mistake was caught by dry-run *and* hard-failed migrate with a clean rollback + resume rather than writing anything wrong, count-diff correctly reports both nesting levels (`hospitals_test.facilities.categoryParts: mongo=3 postgres=3`) |
-| Fan-in reshape helper (PRD §4 non-goal — deliberately **not** part of the mapping DSL): `scripts/fanin_reshape.py`, a standalone script outside `src/mongopg_migrate`, for the "N Mongo documents → 1 target row" case (e.g. latest `KycVerificationStep` per booking) no mapping construct can express. Wraps the standard `$match → $sort → $group → $replaceRoot → $out\|$merge` pattern with dry-run preview, a confirmation gate, and clean errors — then you point `mongopg-migrate` at the resulting already-1:1 derived collection like any other. See `scripts/README.md` | ✅ — live-tested: 6→3 doc reduction with correct latest-status-wins-per-group and `--pick-order asc` (earliest-wins) both confirmed, `--mode merge` verified to leave an unrelated pre-existing document untouched (vs. `--mode out` replacing the whole collection), the missing-unique-index failure `$merge` requires surfaces a clear actionable error instead of a raw traceback, the derived collection round-tripped through the full `validate-mapping`/`dry-run`/`migrate`/`validate` pipeline with zero special-casing |
+| Fan-in reshape helper (PRD §4 non-goal — deliberately **not** part of the mapping DSL): `mongopg-fanin`, a separate installed command, for the "N Mongo documents → 1 target row" case (e.g. latest `KycVerificationStep` per booking) no mapping construct can express. Wraps the standard `$match → $sort → $group → $replaceRoot → $out\|$merge` pattern with dry-run preview, a confirmation gate, and clean errors — then you point `mongopg-migrate` at the resulting already-1:1 derived collection like any other. See [`docs/fanin-reshape.md`](./docs/fanin-reshape.md) | ✅ — live-tested: 6→3 doc reduction with correct latest-status-wins-per-group and `--pick-order asc` (earliest-wins) both confirmed, `--mode merge` verified to leave an unrelated pre-existing document untouched (vs. `--mode out` replacing the whole collection), the missing-unique-index failure `$merge` requires surfaces a clear actionable error instead of a raw traceback, the derived collection round-tripped through the full `validate-mapping`/`dry-run`/`migrate`/`validate` pipeline with zero special-casing |
 | `on_missing: error\|null\|skip_row` (PRD §7 P0, worked example §12.3) — policy for a *dangling* `lookup:` (source value present, but nothing resolves it, e.g. the referenced document was deleted). Previously an unconditional hard-fail with no way to say "I know about this." `null` writes NULL (still fails against a genuinely NOT NULL column — a policy can't rescue a real schema mismatch); `skip_row` drops the row the field's value belongs to — the whole document for a top-level field, one array item for `explode`, one join row for `junction` (`junction` only accepts `error`/`skip_row`, never `null` — `child_fk` is half the row's own identity). Every occurrence counted and reported at migrate, dry-run (as a non-blocking info notice), and independently re-derived at `validate` (count-diff reconciles the known `skip_row` reduction; sample-diff correctly matches a `null`-rescued row instead of false-flagging every one) | ✅ — live-tested against a real dangling-reference scenario (a `KycVerificationStep` referencing a deleted `McmUser`, plus a `junction` tag reference to a deleted tag): default `error` still hard-fails identically to before; `null` correctly nulled the one dangling row while the other two resolved normally, with `validate` showing zero false-positive mismatches (the exact bug this fix targets) and independently re-deriving the same dangling count; `skip_row` correctly dropped only the affected document (junction: only the affected join row, parent order row intact) while advancing the checkpoint past it (confirmed no infinite-retry on re-run) — a real, live-caught bug fixed in the same pass: `validate`'s count-diff didn't reconcile `skip_row`'s deliberate reduction and reported a clean migration as `Validation FAILED`; also fixed live: bare `on_missing: null` in YAML parses to Python `None`, not the string `"null"` — now coerced rather than rejected with a confusing enum error |
 | Duplicate-key safety in the mapping file: `yaml.safe_load`'s default silent last-one-wins for a repeated key (two `fields:` entries for the same source field, two entities with the same name, ...) now raises loudly at `load_mapping_file` instead — found live, writing a mapping that mapped one source field twice (once via `lookup:`, once as a raw passthrough copy): the first entry vanished with zero warning. Same footgun class as the scalar-iteration and bare-`null` bugs above | ✅ — a custom `yaml.SafeLoader` subclass overrides `construct_mapping` to detect the collision before pydantic ever sees the (already-collapsed) dict; live-confirmed both that the duplicate case now raises with a clear message and that the checked-in fixture and every mapping file used elsewhere in this README still load unaffected |
 | Confirmed capability, no new code needed: a source field can already be given *two* dispositions at once — mapped via `fields:` (e.g. `lookup:` + `on_missing: null`) **and** separately preserved raw via `unmapped.jsonb` — `EntityMapping` never enforced disposition-exclusivity. This directly answers a real design question (preserve a dangling reference's original value for forensics, without an FK to a value that isn't there) without adding a dedicated "legacy/raw copy" construct to the mapping DSL | ✅ — live-tested: a dangling `mcmUserId` landed as `user_id = NULL` (per `on_missing: null`) *and* `raw_payload = {"mcmUserId": "<original ObjectId hex>"}` in the same row, `validate` reporting zero mismatches |
@@ -52,9 +52,28 @@ Early, pre-alpha. Implemented so far:
 | Nested `lookup:` invisible to load ordering — a real bug an external reviewer found and reproduced against this exact code, then reproduced again after a fix attempt to confirm it: `entity_dependencies()`/`entity_load_order()` and `validate_structure()` only ever iterated one explode level's own `.fields`, so a `lookup:` one level deeper (`facilities[].categoryParts[].lookup: zcategories`) was invisible to both — wrong load order (unenforced by `entity_load_order()`), and a typo'd nested `lookup:` name passed `validate_structure()` with zero issues. **`on_missing` made the load-order half of this silent, not just wrong**: before `on_missing` existed, an empty id_map from the wrong order was a loud `LoadError`; with `on_missing: null`, every reference then quietly writes NULL, count diff is unaffected (NULLs don't change row counts), `validate`'s own `_count_on_missing` re-derives against the by-then-fully-loaded id_map and reports zero dangling refs, and `validate` reports OK — an all-NULL FK column that passes every check. Fixed at both the cause and the blast radius: `entity_dependencies()`/`validate_structure()` now recurse through nested `explode` (root cause); independently, `_resolve_lookup` now refuses to apply *any* `on_missing` policy when the referenced entity's id_map has zero rows at all — cached per entity, one extra indexed query on the first miss, not per miss — since a policy for one dangling reference is not a correct answer to "this entity never loaded," whether from the ordering bug just fixed or a forgotten prerequisite run (`external_entities` naming a migration nobody actually ran) that no amount of correct-ordering logic *can* catch | ✅ — live-tested all three shapes: the exact reported reproduction (`entity_dependencies()`/`entity_load_order()` now correctly order `zcategories` before `hospitals`, migrated end to end with the nested FK correctly resolved, not NULL); a simulated forgotten-prerequisite-run (`external_entities` naming a migration that was never run, `on_missing: null`) now hard-fails with a message distinguishing "load-order problem" from a real dangling reference, instead of silently writing NULL; a genuinely dangling individual reference (the entity has other rows, just not this one) still correctly nulls as designed — confirming the fix narrows precisely, not just broadly |
 | Live integration tests in CI (`tests/integration/`, its own CI job with real Mongo/Postgres service containers): the "live-tested" claims scattered through this table were previously proven once, by hand, in a dev session, and never re-checked — another old review, re-read verbatim: "consider capturing them as a compose-based integration test so CI proves them, not prose." A first slice: the full `validate-mapping`→`dry-run`→`migrate`→`validate` loop through the actual CLI (`CliRunner`, real Mongo + real Postgres, PRD §12's own worked example), and a genuine SIGKILL-mid-migrate-then-resume test — a real subprocess, killed via polling for actual partial progress (not a guessed sleep), asserting zero duplicates and zero gaps after resuming. Skipped cleanly (not failed) when `MONGO_URI`/`POSTGRES_URI` aren't set, so the plain unit-test suite stays exactly as fast as before | ✅ — both pass reliably against local Docker (3/3 repeated runs, no flakes) and now run in CI on every push |
 
+## Install
+
+```bash
+pip install mongopg-migrate
+```
+
+Two commands are installed: `mongopg-migrate` (the migration tool) and
+`mongopg-fanin` (a Mongo-side reshape helper for the fan-in case — see
+[`docs/fanin-reshape.md`](./docs/fanin-reshape.md)).
+
+Or as a container, with no Python install at all:
+
+```bash
+docker pull ghcr.io/aggtushar123/mongopg-migrate:latest
+```
+
+Python 3.11+. For working on the tool itself, see [Development](#development).
+
 ## Try it
 
 ```bash
+git clone https://github.com/aggtushar123/mongopg-migrate && cd mongopg-migrate
 docker compose up -d          # local Mongo + Postgres, seeded from fixtures/
 pip install -e ".[dev]"
 
@@ -200,15 +219,31 @@ enum whose labels don't match the target column's labels verbatim.
 ### Docker (primary distribution, per PRD §8)
 
 ```bash
-docker compose up -d                                          # local Mongo + Postgres fixture
-docker build -f docker/Dockerfile -t mongopg-migrate:latest .  # the tool itself
+docker pull ghcr.io/aggtushar123/mongopg-migrate:latest
+# ...or build it yourself:
+docker build -f docker/Dockerfile -t mongopg-migrate:latest .
 
-docker run --rm --network mongodbtopostgres_default \
+docker compose up -d                # local Mongo + Postgres fixture
+
+docker run --rm --network mongopg-migrate_default \
   -e MONGO_URI=mongodb://mongo:27017/app \
   -e POSTGRES_URI=postgresql://postgres:postgres@postgres:5432/app \
-  -v "$(pwd)/fixtures/mapping.example.yaml:/app/mapping.yaml:ro" \
-  mongopg-migrate:latest migrate /app/mapping.yaml --mode truncate
+  -v "$(pwd)/fixtures/mapping.example.yaml:/work/mapping.yaml:ro" \
+  ghcr.io/aggtushar123/mongopg-migrate:latest migrate /work/mapping.yaml --mode truncate
 ```
+
+The fan-in helper is the image's second entry point:
+
+```bash
+docker run --rm --entrypoint mongopg-fanin \
+  ghcr.io/aggtushar123/mongopg-migrate:latest --help
+```
+
+The image runs as a non-root user and works in `/work`, so mount your mapping
+file there. The network is `mongopg-migrate_default` on every machine because
+`docker-compose.yml` pins the Compose project name — before v0.1.1 it was
+derived from the checkout directory, so the name documented here was wrong for
+anyone who had cloned into a differently-named folder.
 
 Note the internal Postgres port (`5432`, not the `55432` host-mapped port
 from the local `.venv` examples above) and `--network`, pointing the tool's

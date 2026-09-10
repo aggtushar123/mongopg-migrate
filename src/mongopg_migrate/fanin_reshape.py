@@ -7,8 +7,15 @@ in the mapping DSL"). Every construct `mongopg-migrate` understands
 producing rows — none of them can express, say, "the latest
 KycVerificationStep document per booking" collapsing N step-history
 documents into one row. That's grouping/aggregation, a genuinely different
-shape of work from field mapping, so it's kept out of the core tool and
-out of `src/mongopg_migrate` entirely.
+shape of work from field mapping, so it stays out of the mapping DSL and
+out of the migration engine: nothing in `migrate/` imports it, and it never
+touches Postgres. It ships as its OWN command, `mongopg-fanin`, run against
+Mongo before `mongopg-migrate` sees anything.
+
+(It lived at `scripts/fanin_reshape.py` through v0.1.0, which kept it out of
+the wheel and the Docker image entirely — so the one workflow the README
+told you to run first was the one thing `pip install` did not give you. The
+boundary that matters is architectural, not directory-shaped.)
 
 What this script actually is: a small, safety-conscious wrapper around the
 standard Mongo aggregation pattern for that reshape —

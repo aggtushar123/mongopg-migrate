@@ -1,10 +1,8 @@
-# scripts/
+# `mongopg-fanin` — Stage 0 for fan-in (N docs → 1 row)
 
-Standalone helpers that live outside `src/mongopg_migrate` on purpose —
-each one does something the core tool's mapping DSL deliberately does not
-(see the PRD's non-goals, §4), so it isn't part of `mongopg-migrate` itself.
-
-## `fanin_reshape.py` — Stage 0 for fan-in (N docs → 1 row)
+A separate command, installed alongside `mongopg-migrate`, for something
+the mapping DSL deliberately does not do (see the PRD's non-goals, §4). It
+runs against Mongo only and never touches Postgres.
 
 None of the mapping DSL's constructs (`fields`, `explode`, `junction`,
 `unpivot`) can express "N Mongo documents collapse into 1 target row" —
@@ -19,14 +17,14 @@ group, pick one document per group, write to a new collection — so the
 
 ```bash
 # Preview first — writes nothing:
-python scripts/fanin_reshape.py \
+mongopg-fanin \
   --mongo-uri mongodb://localhost:27017/app --database app \
   --source kycVerificationSteps --dest kycVerificationSteps_latest \
   --group-by bookingId --pick-latest-by updatedAt \
   --mode out --dry-run
 
 # Then actually write:
-python scripts/fanin_reshape.py \
+mongopg-fanin \
   --mongo-uri mongodb://localhost:27017/app --database app \
   --source kycVerificationSteps --dest kycVerificationSteps_latest \
   --group-by bookingId --pick-latest-by updatedAt \
@@ -59,7 +57,7 @@ reduction this script performs is never re-checked by anything
 downstream of it. Look at `--dry-run`'s preview before committing to a
 write.
 
-See `python scripts/fanin_reshape.py --help` for the full flag reference,
+See `mongopg-fanin --help` for the full flag reference,
 and `tests/test_fanin_reshape.py` for behavior (the `$merge` write path
 itself is live-Docker-verified rather than unit-tested — `mongomock`
 doesn't implement `$merge`).

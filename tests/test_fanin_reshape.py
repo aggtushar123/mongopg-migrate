@@ -1,8 +1,8 @@
-"""Tests for scripts/fanin_reshape.py — the standalone Stage-0 helper for
+"""Tests for the `mongopg-fanin` command — the Stage-0 helper for
 the fan-in case (N Mongo documents -> 1 derived document) the core tool's
 mapping DSL deliberately does not support (PRD §4 non-goal). Deliberately
-outside src/mongopg_migrate; imported here by file path since it isn't an
-installed package module.
+a separate command from `mongopg-migrate`, and imported normally here
+because it is a real module in the installed package.
 
 $merge isn't implemented by mongomock (confirmed directly: it raises
 NotImplementedError), so the $merge write path itself is live-Docker-
@@ -13,26 +13,19 @@ pipeline construction, validation/error paths, and the full $out write
 path — is covered here with mongomock or no DB at all.
 """
 
-import importlib.util
 import json
-import sys
-from pathlib import Path
 
 import mongomock
 import pytest
 
-SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "fanin_reshape.py"
-_spec = importlib.util.spec_from_file_location("fanin_reshape", SCRIPT_PATH)
-fanin_reshape = importlib.util.module_from_spec(_spec)
-sys.modules["fanin_reshape"] = fanin_reshape
-_spec.loader.exec_module(fanin_reshape)
-
-build_pickone_pipeline = fanin_reshape.build_pickone_pipeline
-build_output_stage = fanin_reshape.build_output_stage
-load_custom_pipeline = fanin_reshape.load_custom_pipeline
-run_reshape = fanin_reshape.run_reshape
-ReshapeError = fanin_reshape.ReshapeError
-
+from mongopg_migrate import fanin_reshape
+from mongopg_migrate.fanin_reshape import (
+    ReshapeError,
+    build_output_stage,
+    build_pickone_pipeline,
+    load_custom_pipeline,
+    run_reshape,
+)
 
 # --- build_pickone_pipeline --------------------------------------------------------------
 

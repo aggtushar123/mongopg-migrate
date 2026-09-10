@@ -8,6 +8,12 @@
 #     --mongo-uri mongodb://localhost:27017/app \
 #     --postgres-uri postgresql://postgres:postgres@localhost:55432/app
 
+# Pin the project name. Without it Compose derives it from the CHECKOUT
+# DIRECTORY, so the network is `<whatever-you-cloned-into>_default` and any
+# documented `--network` value is wrong for everyone whose folder is named
+# differently than the author's.
+name: mongopg-migrate
+
 services:
   mongo:
     image: mongo:7

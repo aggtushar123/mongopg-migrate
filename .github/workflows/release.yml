@@ -1,0 +1,152 @@
+# Publishes a release when a version tag is pushed:
+#
+#   git tag -a v0.1.1 -m "v0.1.1" && git push origin v0.1.1
+#
+# The three publish jobs are deliberately INDEPENDENT of each other and all
+# depend on `verify`. PyPI needs one-time setup outside this repo (see the
+# `pypi` job); GHCR and the GitHub Release do not. Keeping them separate means
+# an unconfigured PyPI cannot block the container image, and neither can block
+# the release notes.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  # Nothing is published until the tag, the declared version, and the test
+  # suite all agree. Tagging v0.1.2 while pyproject still says 0.1.1 is the
+  # classic way to publish a wrong artifact that cannot be replaced: PyPI
+  # does not allow re-uploading a version, ever.
+  verify:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Tag must match the version in pyproject.toml
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          declared=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag=$tag declared=$declared"
+          if [ "$tag" != "$declared" ]; then
+            echo "::error::tag v$tag does not match pyproject.toml version $declared"
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Install and test
+        run: |
+          pip install -e ".[dev]"
+          ruff check src tests
+          pytest -q
+
+      - name: Build sdist + wheel
+        run: |
+          pip install build
+          python -m build
+
+      - name: The built artifacts must be installable and runnable
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install dist/*.whl
+          /tmp/fresh/bin/mongopg-migrate --version
+          /tmp/fresh/bin/mongopg-fanin --help > /dev/null
+          echo "both entry points work from a clean install"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    needs: verify
+    runs-on: ubuntu-latest
+    # Trusted publishing (OIDC) — no API token stored in this repo. One-time
+    # setup: on PyPI, add a trusted publisher for this repository with
+    # workflow `release.yml` and environment `pypi`. Until that exists this
+    # job fails and the others still succeed.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mongopg-migrate
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  ghcr:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # `latest` only for a final release — a prerelease tag such as
+          # v0.2.0rc1 must not become what `docker pull` gives by default.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, 'rc') && !contains(github.ref_name, 'a') && !contains(github.ref_name, 'b') }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.verify.outputs.version }}
+            VCS_REF=${{ github.sha }}
+
+  github-release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for what changed.
+
+            ```bash
+            pip install mongopg-migrate==${{ needs.verify.outputs.version }}
+            docker pull ghcr.io/${{ github.repository }}:${{ needs.verify.outputs.version }}
+            ```

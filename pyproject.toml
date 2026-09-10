@@ -4,12 +4,37 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mongopg-migrate"
-version = "0.1.0"
+version = "0.1.1"
 description = "Map MongoDB collections onto an existing, independently designed PostgreSQL schema and run a validated, repeatable migration."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
-authors = [{ name = "mongopg-migrate contributors" }]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Tushar Aggarwal" }]
+keywords = [
+    "mongodb",
+    "postgresql",
+    "postgres",
+    "migration",
+    "etl",
+    "data-migration",
+    "schema-mapping",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Archiving :: Mirroring",
+    "Typing :: Typed",
+]
 dependencies = [
     "pymongo>=4.6",
     "psycopg[binary]>=3.1",
@@ -32,11 +57,39 @@ llm = [
     "anthropic>=1.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/aggtushar123/mongopg-migrate"
+Repository = "https://github.com/aggtushar123/mongopg-migrate"
+Issues = "https://github.com/aggtushar123/mongopg-migrate/issues"
+Changelog = "https://github.com/aggtushar123/mongopg-migrate/blob/main/CHANGELOG.md"
+
 [project.scripts]
 mongopg-migrate = "mongopg_migrate.cli:main"
+# The fan-in reshape helper: a separate command because it is a Mongo-side
+# pre-processing step, not part of the mapping DSL (PRD §4 non-goal).
+mongopg-fanin = "mongopg_migrate.fanin_reshape:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mongopg_migrate"]
+
+# An ALLOWLIST on purpose. Hatchling's default sdist sweeps in everything the
+# working tree happens to contain, including untracked scratch files — a
+# release is a bad place to discover that. Add new directories here
+# deliberately rather than relying on what a build machine happens to hold.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/fixtures",
+    "/docs",
+    "/docker",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/docker-compose.yml",
+    "/PRD-mongo-postgres-migration-tool.md",
+]
 
 [tool.ruff]
 line-length = 100

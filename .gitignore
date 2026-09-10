@@ -10,3 +10,7 @@ mapping.yaml
 # Never commit a real connection string or credential file.
 *.env
 !*.env.template
+
+# Build artifacts
+dist/
+build/
