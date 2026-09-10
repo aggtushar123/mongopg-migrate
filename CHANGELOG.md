@@ -29,6 +29,21 @@ under **Changed** with a migration note.
 - README documentation for all of the above — the Transform DSL section had
   not been updated for `truncate:`/`trim`/pipelines, and `depends_on:` was
   documented nowhere.
+- `docs/engineering-log.md`, and `tests/test_doc_claims.py` (11) to keep the
+  documentation's claims honest automatically.
+
+### Changed
+
+- **The README status table no longer claims more than the repo can show.**
+  It carried ~45 rows marked "✅ — live-tested", which read as a uniform
+  guarantee; most were unreproducible notes from a development session, some
+  quoting specific figures derived from data that is not in this repository.
+  The README now cites, per capability, the tests that actually back it —
+  including three entries it previously implied were proven and which are
+  not: `--mode upsert` (SQL generation only), the Docker image
+  (hand-verified), and `append`/`upsert` resuming a `done` entity (no test at
+  all). The full history moves to `docs/engineering-log.md`, where every
+  entry carries an explicit evidence label.
 
 ## [0.1.1] — 2026-09-10
 
