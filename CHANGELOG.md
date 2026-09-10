@@ -11,48 +11,6 @@ under **Changed** with a migration note.
 
 ## [Unreleased]
 
-### Fixed
-
-- A `|` inside an `enum:` JSON object was treated as a pipeline separator, so
-  `enum:{"A|B": "both"}` was chopped mid-JSON and failed with an
-  unterminated-string error naming neither the pipeline nor the pipe — and did
-  so even when `enum:` was the only transform on the field, since two steps is
-  what sends a spec down the pipeline path at all. Splitting is now aware of
-  JSON nesting and strings. `split:` on a literal pipe combined with other
-  steps remains ambiguous by construction, and now says so.
-
-### Added
-
-- Tests for the features that shipped in 0.1.1 without any: transform
-  pipelines, `truncate:`, `trim`, `depends_on:`, and the id_map
-  prefetch/`put_many` fast path (72 tests).
-- README documentation for all of the above — the Transform DSL section had
-  not been updated for `truncate:`/`trim`/pipelines, and `depends_on:` was
-  documented nowhere.
-- `docs/engineering-log.md`, and `tests/test_doc_claims.py` (11) to keep the
-  documentation's claims honest automatically.
-- Live tests for the two production paths that had none: `--mode upsert`
-  against a real Postgres (`integration/test_upsert_live.py`, 6) and resuming
-  an entity already marked `done` (`integration/test_resume_done_entity_live.py`,
-  8). The integration suite goes from 6 tests to 20.
-- A "Re-running a migration" README section, documenting two behaviours the
-  new tests surfaced: a MODIFIED source document is not picked up while the
-  entity's checkpoint stands, and re-processing a document duplicates its
-  `explode` children (which `validate` catches, but the loader does not).
-
-### Changed
-
-- **The README status table no longer claims more than the repo can show.**
-  It carried ~45 rows marked "✅ — live-tested", which read as a uniform
-  guarantee; most were unreproducible notes from a development session, some
-  quoting specific figures derived from data that is not in this repository.
-  The README now cites, per capability, the tests that actually back it —
-  including three entries it previously implied were proven and which are
-  not: `--mode upsert` (SQL generation only), the Docker image
-  (hand-verified), and `append`/`upsert` resuming a `done` entity (no test at
-  all). The full history moves to `docs/engineering-log.md`, where every
-  entry carries an explicit evidence label.
-
 ## [0.1.1] — 2026-09-10
 
 First published release. `0.1.0` existed in `pyproject.toml` but was never
@@ -78,6 +36,12 @@ tagged or distributed, so everything below is new to anyone installing this.
 - The loader ignored `id_strategy.source_field` and always hashed `_id`,
   while `dry-run` already honoured it — so a mapping could pass `dry-run` and
   then fail the real load with a foreign-key violation.
+- A `|` inside an `enum:` JSON object was treated as a pipeline separator, so
+  `enum:{"A|B": "both"}` was chopped mid-JSON and failed with an
+  unterminated-string error naming neither the pipeline nor the pipe — even
+  when `enum:` was the only transform on the field. Splitting is now aware of
+  JSON nesting and strings. `split:` on a literal pipe combined with other
+  steps stays ambiguous by construction, and now says so.
 - An embedded object mapped onto a `json`/`jsonb` column failed `COPY`
   (`cannot adapt type 'dict'`). jsonb was previously reachable only through
   `unmapped.jsonb`.
@@ -110,7 +74,17 @@ tagged or distributed, so everything below is new to anyone installing this.
   entity after the parent table, not a micro-optimisation.
 - Packaging metadata for distribution: project URLs, classifiers, keywords,
   and an explicit sdist allowlist so a release cannot pick up untracked files
-  from a build machine.
+  from a build machine. A tagged release publishes to PyPI and GHCR.
+- Tests for every feature above, which had shipped without any: 72 for
+  pipelines/`truncate:`/`trim`/`depends_on`/the id_map fast path, plus live
+  tests for the two production paths that had none — `--mode upsert` against a
+  real Postgres and resuming an entity already marked `done`. The integration
+  suite goes from 6 tests to 20.
+- README sections for all of the above: the Transform DSL, load ordering, and
+  "Re-running a migration", which documents two behaviours the new live tests
+  surfaced — a MODIFIED source document is not picked up while the entity's
+  checkpoint stands, and re-processing a document duplicates its `explode`
+  children (which `validate` catches, but the loader does not).
 
 ### Changed
 
@@ -119,6 +93,15 @@ tagged or distributed, so everything below is new to anyone installing this.
   rather than a raw SQL string. This is an internal API change.
 - Removed `migration/` and `table-definitions/`, which were specific to one
   deployment rather than part of a general-purpose tool.
+- **The README status table no longer claims more than the repo can show.** It
+  carried ~45 rows marked "✅ — live-tested", which read as a uniform
+  guarantee; most were unreproducible notes from a development session, some
+  quoting figures derived from data that is not in this repository. The README
+  now cites, per capability, the tests that back it, and `tests/test_doc_claims.py`
+  fails the build if a citation is wrong. The full history moves to
+  `docs/engineering-log.md`, where every entry carries an explicit evidence
+  label. One capability is still marked unproven: the Docker image is
+  hand-verified, with no test asserting it behaves.
 
 [Unreleased]: https://github.com/aggtushar123/mongopg-migrate/compare/v0.1.1...HEAD
 [0.1.1]: https://github.com/aggtushar123/mongopg-migrate/releases/tag/v0.1.1
