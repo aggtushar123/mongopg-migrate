@@ -623,6 +623,63 @@ def _clone_schema_for_dryrun(
     return temp_schema
 
 
+def _seed_external_id_map(
+    conn: psycopg.Connection,
+    mapping: MappingFile,
+    internal_schema: str,
+    *,
+    source_schema: str = idmap.DEFAULT_SCHEMA_NAME,
+) -> int:
+    """Copy REFERENCE id_map rows from the real `_mongopg.id_map` into the
+    dry run's disposable one.
+
+    A `lookup:` can point at an entity this mapping never loads — reference
+    data with no source collection, seeded straight into Postgres and into
+    id_map by hand (PRD §12 `external_entities`). The real `migrate` resolves
+    those against the live `_mongopg.id_map` and succeeds; the dry run built
+    its id_map empty and so reported every one of them as a lookup miss:
+
+        lookup miss: no _mongopg_dryrun_<...>.id_map row for
+        entity='departments' source_id='CLAIM_TEAM'
+
+    That is a false violation — "do not run migrate yet" for a mapping that
+    in fact migrates cleanly — and it made `external_entities` unusable with
+    dry-run at all.
+
+    EVERY row is copied, including rows under entity names this mapping does
+    load. That is deliberate: seeded reference rows are not always filed under
+    a name outside the mapping. The hospital wave files its derived
+    HospitalDetails._id -> hospitals.id rows under the `hospitals` entity
+    precisely so `lookup: hospitals` creates a load-order edge, and skipping
+    mapped entities here left those rows out — every hospital_documents and
+    hospital_bed_details row then failed its lookup and was skipped, which the
+    loader correctly refused as a load-order problem rather than a dangling
+    reference.
+
+    Copying them wholesale is safe because the dry run overwrites as it goes:
+    `idmap.put` upserts, so any key this run actually produces replaces the
+    copied value before anything reads it, and `objectid_to_uuid` is
+    deterministic so the two agree regardless. The only rows that survive
+    untouched are the ones this run never generates — exactly the seeded
+    reference rows this function exists to preserve.
+
+    Cross-database lookups (`external_databases:`) are unaffected — those
+    resolve against the other database's own id_map, which a dry run never
+    replaces.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (f'"{source_schema}"."{idmap.TABLE_NAME}"',))
+        row = cur.fetchone()
+        if row is None or row[0] is None:
+            return 0  # no real id_map yet — nothing seeded, nothing to copy
+        cur.execute(
+            f'INSERT INTO "{internal_schema}"."{idmap.TABLE_NAME}" (entity, source_id, target_id) '
+            f'SELECT entity, source_id, target_id FROM "{source_schema}"."{idmap.TABLE_NAME}" '
+            "ON CONFLICT (entity, source_id) DO NOTHING"
+        )
+        return cur.rowcount
+
+
 def _drop_dryrun_artifacts(conn: psycopg.Connection, temp_schema: str, internal_schema: str) -> None:
     with conn.cursor() as cur:
         cur.execute(f'DROP SCHEMA IF EXISTS "{temp_schema}" CASCADE')
@@ -650,6 +707,12 @@ def run_realistic_pass(
             )
 
         try:
+            # The disposable id_map must start holding the reference rows the
+            # real run will see (external_entities seeded by hand), or every
+            # such lookup reports a false miss. See _seed_external_id_map.
+            idmap.ensure_schema(setup_conn, schema=internal_schema)
+            _seed_external_id_map(setup_conn, mapping, internal_schema)
+
             search_path = f'"{temp_schema}", public'
             run_batch_load(
                 mapping,

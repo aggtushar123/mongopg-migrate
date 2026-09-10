@@ -87,6 +87,7 @@ from mongopg_migrate.mapping.schema import (
     EntityMapping,
     ExplodeSpec,
     FieldSpec,
+    IdStrategyType,
     MappingFile,
     OnMissing,
     UnpivotItem,
@@ -427,6 +428,28 @@ def _resolve_field_value(
         value = apply_transform(fspec.transform, raw)
     value = apply_default(fspec.transform, value)
 
+    # An embedded object/array mapped straight onto a json/jsonb column has to
+    # be handed to psycopg as Jsonb, exactly like the `unmapped.jsonb` payload
+    # already is (_build_jsonb_payload). Without this, COPY dies on the raw
+    # dict — jsonb was only ever reachable through `unmapped.jsonb`, never
+    # through an ordinary field mapping:
+    #     ERROR: cannot adapt type 'dict' using placeholder '%t' (format: TEXT)
+    # Hit by kyc_info.details, an embedded object in Mongo and a NOT NULL
+    # jsonb column in Postgres. json_safe() first, so BSON types with no JSON
+    # equivalent (ObjectId, Decimal128, datetime) survive the trip.
+    # Any non-null value, not just dict/list: a bare string, number or bool is
+    # a perfectly valid JSON scalar, and a legacy field is rarely one shape
+    # throughout. SagaState.error is an object on most documents and a plain
+    # message on others ("Invalid request: Missing required fields"), which
+    # reached COPY as raw text and was rejected as malformed JSON:
+    #     DETAIL: Token "Invalid" is invalid.
+    #     CONTEXT: JSON data, line 1: Invalid...
+    if value is not None:
+        col = pg_schema.tables.get(target_table)
+        col_info = col.columns.get(fspec.target) if col else None
+        if col_info is not None and col_info.data_type.lower() in ("json", "jsonb"):
+            return Jsonb(json_safe(value))
+
     if value is None:
         col = pg_schema.tables.get(target_table, None)
         col_info = col.columns.get(fspec.target) if col else None
@@ -665,6 +688,24 @@ def _load_entity_batches(
         for uname, unp in entity.unpivot.items()
     }
 
+    # Bulk-load every id_map this entity will resolve against, once, before the
+    # first batch. `_resolve_lookup` calls idmap.get() once per `lookup:` field
+    # per row, and each of those is a network round trip; over a VPN to RDS that
+    # single statement set the pace for every wave after the parent table
+    # (`empanelment_status_details` is 64670 rows all looking up `hospitals`).
+    #
+    # Correct to snapshot here rather than per batch: entity_load_order() has
+    # already fully loaded and committed everything this entity looks up, and a
+    # self-lookup is a rejected circular dependency — so the map cannot grow
+    # underneath us. idmap.put/put_many write through to the snapshot anyway.
+    for dep in sorted(entity.lookup_entities()):
+        if dep in (external_conns or {}):
+            # Cross-database entity: its id_map lives in ITS database, under the
+            # standard schema name — same rule _resolve_lookup applies.
+            idmap.prefetch(external_conns[dep], dep, schema=idmap.DEFAULT_SCHEMA_NAME)
+        else:
+            idmap.prefetch(conn, dep, schema=internal_schema)
+
     cp = checkpoint.get(conn, entity_name, schema=internal_schema)
     was_previously_done = cp is not None and cp.status == "done"
     resume_from = cp.last_source_id if cp else None
@@ -694,9 +735,52 @@ def _load_entity_batches(
         last_id_in_batch = None
 
         for doc in batch:
+            # `source_id` stays the document's own `_id`: it is the resume
+            # cursor (`find({"_id": {"$gt": ...}})`, which only sorts correctly
+            # on _id), the id_map KEY other entities' `lookup:` resolve
+            # against, and what report/validate.py re-fetches the source
+            # document by. None of those may change.
             source_id = doc["_id"]
+
+            # The IDENTITY the id_strategy derives from is a separate thing,
+            # and `id_strategy.source_field` is what names it. This module used
+            # to ignore that field entirely and always hash `_id`, even though
+            # the schema REQUIRES source_field for every non-serial strategy
+            # and migrate/dryrun.py's fast layer already honours it
+            # (`strategy.source_field or "_id"`). The two disagreeing is how a
+            # mapping can pass dry-run and then fail the real load:
+            #     hospital_details is keyed on `hospitalId` so its id equals
+            #     hospitals.id — a strict 1:1 table, and `unpivot:` writes the
+            #     ENTITY'S OWN resolved id into parent_fk — but the loader
+            #     produced uuid5(_id) instead:
+            #     ERROR: insert or update on table "hospital_facilities" violates
+            #            foreign key constraint ... Key (hospital_id)=(...) is not
+            #            present in table "hospitals"
+            id_field = entity.id_strategy.source_field or "_id"
+            identity_value = source_id if id_field == "_id" else get_nested(doc, id_field)
+            if identity_value is None and entity.id_strategy.type is not IdStrategyType.SERIAL:
+                # If the very same field is also mapped with `on_missing:
+                # skip_row`, honour that here rather than failing the run. The
+                # mapping has already said "a row whose reference does not
+                # resolve is not worth keeping", and an ABSENT value is the
+                # stronger form of that condition — the row cannot be written
+                # either way. Found on one PaymentDetails document that is not
+                # a payment at all (a stray patient record with no bookingId
+                # and no amounts) sitting in a 12887-document collection.
+                id_fspec = entity.fields.get(id_field)
+                if id_fspec is not None and id_fspec.on_missing is OnMissing.SKIP_ROW:
+                    rows_skipped += 1
+                    last_id_in_batch = source_id
+                    continue
+                raise LoadError(
+                    f"{entity_name}: id_strategy.source_field {id_field!r} is missing or null on document "
+                    f"_id={source_id!r} — it establishes the row's identity, so there is nothing sensible "
+                    "to write. Point source_field at a field that is always present, map that field with "
+                    "`on_missing: skip_row` to drop such documents deliberately, or filter them out of "
+                    "the entity."
+                )
             resolved = resolve_new_id(
-                entity.id_strategy, source_id, conn=conn, column_default=id_col_default, id_buffer=id_buffer
+                entity.id_strategy, identity_value, conn=conn, column_default=id_col_default, id_buffer=id_buffer
             )
 
             # Everything for this one document is built into LOCAL
@@ -844,8 +928,10 @@ def _load_entity_batches(
             else:
                 _copy_rows(conn, unp.target, cols, unpivot_rows[uname])
 
-        for e, s, t in idmap_entries:
-            idmap.put(conn, e, s, t, schema=internal_schema)
+        # One statement per chunk, not one per row — see idmap.put_many. This is
+        # inside the same transaction as the COPY above and the checkpoint
+        # advance below, so the atomicity PRD §7 requires is unchanged.
+        idmap.put_many(conn, idmap_entries, schema=internal_schema)
         # rows_delta is main_rows, not len(batch): a batch containing
         # skip_row-dropped documents loaded fewer main-table rows than
         # documents it saw — the checkpoint's rows_loaded counter should

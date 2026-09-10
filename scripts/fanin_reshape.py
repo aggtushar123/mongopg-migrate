@@ -156,7 +156,46 @@ def run_reshape(
             }
 
         output_stage = build_output_stage(mode, dest, merge_on)
-        list(db[source].aggregate([*pipeline, output_stage]))
+        try:
+            list(db[source].aggregate([*pipeline, output_stage]))
+        except pymongo.errors.OperationFailure as e:
+            # Mongo refuses $out/$merge into an INTERNAL database (admin, local,
+            # config) — "Can't $out to internal database: admin", Location31321.
+            #
+            # That is normally a non-issue, but this production deployment keeps
+            # its application collections INSIDE `admin`, so the derived
+            # collection has to live there too: mongopg-migrate resolves an
+            # entity's `source:` within get_default_database(), and pointing the
+            # tool at another database would stop every other collection
+            # resolving.
+            #
+            # Ordinary writes to `admin` are permitted — only the aggregation
+            # output stages are special-cased by the server. So fall back to
+            # running the pipeline as a plain read and inserting the results
+            # client-side. Same documents, same pipeline, one extra round trip
+            # per batch; the only thing lost is server-side atomicity, which
+            # `$out` gives by swapping the collection in at the end.
+            if e.code != 31321:
+                raise
+            if mode != "out":
+                raise ReshapeError(
+                    f"{e}\n\n--mode merge cannot fall back for an internal database. "
+                    "Re-run with --mode out, which this script can emulate client-side."
+                ) from e
+            click.echo(
+                f"NOTE: the server refuses $out into internal database {db.name!r} "
+                "(Location31321).\n"
+                "      Falling back to a client-side rebuild: run the pipeline as a read,\n"
+                "      then replace the destination collection with the results.\n"
+                "      Same documents; loses only $out's server-side atomic swap.",
+                err=True,
+            )
+            docs = list(db[source].aggregate(pipeline))
+            # Match $out's replace-everything semantics: drop, then insert.
+            db[dest].drop()
+            if docs:
+                for i in range(0, len(docs), 1000):
+                    db[dest].insert_many(docs[i : i + 1000], ordered=False)
         dest_count = db[dest].count_documents({})
         return {
             "dry_run": False,

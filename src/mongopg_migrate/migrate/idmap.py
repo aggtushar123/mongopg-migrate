@@ -25,6 +25,8 @@ Postgres has no parameterized-identifier support to escape them with.
 
 from __future__ import annotations
 
+import weakref
+
 import psycopg
 
 DEFAULT_SCHEMA_NAME = "_mongopg"
@@ -33,6 +35,68 @@ TABLE_NAME = "id_map"
 
 def _qualified(schema: str) -> str:
     return f'"{schema}"."{TABLE_NAME}"'
+
+
+# ── Prefetch cache ───────────────────────────────────────────────────────────
+# `get()` is one network round trip, and `_resolve_lookup` calls it once per
+# `lookup:` field per row. Over a VPN to RDS that is the dominant cost of every
+# wave after the parent table: `empanelment_status_details` (64670 rows) and
+# `hospital_details` (41793) each resolve `lookup: hospitals` on every single
+# row, so the load rate collapses to roughly one row per round trip.
+#
+# `prefetch()` reads one entity's whole map in a single query and keeps it here;
+# `get()` then answers from memory. It is deliberately OPT-IN — `get()` keeps
+# its original single-row behaviour for any (conn, schema, entity) that was
+# never prefetched, so callers that have no batch context (report/validate.py,
+# migrate/dryrun.py) and the existing tests are untouched.
+#
+# Safe because of load order, not luck: `entity_load_order()` guarantees an
+# entity is fully loaded and committed before anything that looks it up starts,
+# and a self-lookup is rejected as a circular dependency. So a snapshot taken
+# when the first dependent begins cannot go stale underneath it. `put()`/
+# `put_many()` additionally write through to any live snapshot, which covers
+# the remaining case of a read-back during an entity's own load.
+#
+# Keyed on a weak reference to the connection: cache lifetime follows the
+# connection's, with no risk of an `id()` being reused by a later object.
+_PREFETCHED: weakref.WeakKeyDictionary[psycopg.Connection, dict[tuple[str, str], dict[str, str]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def prefetch(conn: psycopg.Connection, entity: str, *, schema: str = DEFAULT_SCHEMA_NAME) -> int:
+    """Load one entity's entire id_map into memory for this connection.
+
+    Returns the number of rows cached. Re-prefetching replaces the snapshot.
+    """
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT source_id, target_id FROM {_qualified(schema)} WHERE entity = %s", (entity,))
+        rows = cur.fetchall()
+    _PREFETCHED.setdefault(conn, {})[(schema, entity)] = {str(s): str(t) for s, t in rows}
+    return len(rows)
+
+
+def is_prefetched(conn: psycopg.Connection, entity: str, *, schema: str = DEFAULT_SCHEMA_NAME) -> bool:
+    return (schema, entity) in _PREFETCHED.get(conn, {})
+
+
+def clear_prefetch(conn: psycopg.Connection | None = None) -> None:
+    """Drop cached snapshots — for one connection, or all of them."""
+    if conn is None:
+        _PREFETCHED.clear()
+    else:
+        _PREFETCHED.pop(conn, None)
+
+
+def _write_through(conn: psycopg.Connection, entries: list[tuple[str, str, str]], schema: str) -> None:
+    """Keep any live snapshot consistent with rows just written."""
+    cached = _PREFETCHED.get(conn)
+    if not cached:
+        return
+    for entity, source_id, target_id in entries:
+        snapshot = cached.get((schema, entity))
+        if snapshot is not None:
+            snapshot[str(source_id)] = str(target_id)
 
 
 def ddl(schema: str = DEFAULT_SCHEMA_NAME) -> str:
@@ -75,11 +139,84 @@ def put(
             """,
             (entity, source_id, target_id),
         )
+    _write_through(conn, [(entity, source_id, target_id)], schema)
+
+
+# Rows per INSERT in put_many. Each row costs 3 placeholders and Postgres caps a
+# statement at 65535 of them, so 5000 (15000 placeholders) stays well inside the
+# limit whatever batch size the caller was given.
+_PUT_MANY_CHUNK = 5000
+
+
+def put_many(
+    conn: psycopg.Connection, entries: list[tuple[str, str, str]], *, schema: str = DEFAULT_SCHEMA_NAME
+) -> None:
+    """Record many ID remappings in one round trip per chunk.
+
+    Semantically identical to calling `put()` in a loop, and like `put()` it
+    does not commit — the caller still owns the transaction boundary that keeps
+    these rows atomic with the table load they belong to (PRD §7).
+
+    It exists because the loop version is one network round trip PER ROW. On
+    localhost that is invisible; across a VPN to RDS it is the entire runtime.
+    Measured on the hospital wave over the tunnel: ~1000 rows/min, with the
+    connection sitting `idle in transaction` on
+
+        INSERT INTO "_mongopg"."id_map" ... VALUES ($1, $2, $3)
+
+    between every row. The COPY that loads the actual table was already
+    batched; this was the one per-row statement left, so it set the pace for
+    the whole migration. Raising `--batch-size` does NOT help — the inserts are
+    per row regardless, and a bigger batch only delays each checkpoint.
+
+    Duplicate keys within one call: the ON CONFLICT clause cannot see rows
+    inserted by the same statement, so a repeated (entity, source_id) inside a
+    single chunk would raise
+        ON CONFLICT DO UPDATE command cannot affect row a second time
+    rather than last-write-wins as the loop did. Callers pass one entry per
+    document per entity, so this cannot arise from a well-formed mapping — but
+    de-duplicating here keeps the two functions interchangeable instead of
+    turning a mapping bug into a confusing Postgres error.
+    """
+    if not entries:
+        return
+
+    deduped: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for entity, source_id, target_id in entries:
+        deduped[(entity, source_id)] = (entity, source_id, target_id)
+    rows = list(deduped.values())
+
+    qualified = _qualified(schema)
+    with conn.cursor() as cur:
+        for start in range(0, len(rows), _PUT_MANY_CHUNK):
+            chunk = rows[start : start + _PUT_MANY_CHUNK]
+            values = ", ".join(["(%s, %s, %s)"] * len(chunk))
+            params: list[str] = []
+            for entity, source_id, target_id in chunk:
+                params += [entity, source_id, target_id]
+            cur.execute(
+                f"""
+                INSERT INTO {qualified} (entity, source_id, target_id)
+                VALUES {values}
+                ON CONFLICT (entity, source_id) DO UPDATE SET target_id = EXCLUDED.target_id
+                """,
+                params,
+            )
+    _write_through(conn, rows, schema)
 
 
 def get(
     conn: psycopg.Connection, entity: str, source_id: str, *, schema: str = DEFAULT_SCHEMA_NAME
 ) -> str | None:
+    # Served from memory when this entity was prefetched for this connection.
+    # A prefetched snapshot is authoritative: a miss here is a real miss, not a
+    # stale one (see the _PREFETCHED comment above on why load order makes that
+    # true), so it must NOT fall through to a query — doing so would put the
+    # per-row round trip straight back for exactly the dangling references that
+    # `on_missing` exists to handle.
+    snapshot = _PREFETCHED.get(conn, {}).get((schema, entity))
+    if snapshot is not None:
+        return snapshot.get(str(source_id))
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT target_id FROM {_qualified(schema)} WHERE entity = %s AND source_id = %s",

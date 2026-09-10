@@ -43,7 +43,43 @@ def get_nested(doc: dict, dotted_path: str) -> Any:
     return value
 
 
+# Separator for a transform PIPELINE, e.g. "default:NONE|truncate:32".
+# Each step runs left to right on the previous step's output.
+TRANSFORM_PIPE = "|"
+
+
+def split_pipeline(transform: str | None) -> list[str]:
+    """Split a transform spec into its steps. A spec with no pipe is a
+    one-step pipeline, so every caller can treat the two uniformly."""
+    if not transform:
+        return []
+    return [step.strip() for step in transform.split(TRANSFORM_PIPE) if step.strip()]
+
+
 def apply_transform(transform: str | None, value: Any) -> Any:
+    """Apply a transform spec, which may be a `|`-separated PIPELINE.
+
+    A pipeline exists because a single field can need two unrelated fixes at
+    once and `transform:` has only one slot. The case that forced it:
+    `hospitals.hl_number` is varchar(32) NOT NULL, one of 64691 source
+    documents has no hlNumber at all (needs `default:`), and a different one
+    holds a 35-character value (needs `truncate:32`). Either alone leaves the
+    other row failing the load, and the field cannot be left unmapped because
+    the column is NOT NULL.
+
+    Steps run left to right. `default:` is the exception: it is applied by
+    `apply_default` AFTER the rest, since it only fires when the value is
+    None and a None short-circuits every other step anyway.
+    """
+    steps = split_pipeline(transform)
+    if len(steps) > 1:
+        for step in steps:
+            value = _apply_one(step, value)
+        return value
+    return _apply_one(transform, value)
+
+
+def _apply_one(transform: str | None, value: Any) -> Any:
     if transform is None or value is None:
         return value
     if transform.startswith("json_extract:"):
@@ -64,7 +100,40 @@ def apply_transform(transform: str | None, value: Any) -> Any:
         return _apply_enum(transform, value)
     if transform.startswith("split:"):
         return _apply_split(transform, value)
+    if transform.startswith("truncate:"):
+        return _apply_truncate(transform, value)
+    if transform == "trim":
+        return _apply_trim(value)
     raise TransformError(f"unrecognized transform {transform!r} — see migrate/transform.py")
+
+
+def _apply_trim(value: Any) -> Any:
+    """`trim` strips leading and trailing whitespace.
+
+    Deliberately narrow: it removes PADDING, never content, so it is not a
+    `truncate:` in disguise and does not need the same "declared loss" framing.
+    Internal whitespace is left alone — collapsing that would change values like
+    'Liberty  General Insurance' silently, which is a normalisation decision
+    belonging in a lookup table, not in a field transform.
+
+    The case that forced it: one source document's reference-number field was
+    48607 characters — an 18-character value followed by ~48 KB of trailing
+    spaces. The column is varchar(128) and the COPY aborted:
+
+        ERROR: value too long for type character varying(128)
+
+    Widening to hold that would size a column for padding rather than data;
+    across all 8548 source values the longest TRIMMED length is 57, which the
+    existing varchar(128) already fits. So the honest fix is to drop the
+    whitespace, not to store it.
+
+    `report/validate.py` applies the same transform to the source side, so a
+    trimmed value is not reported as a mismatch.
+
+    Non-strings pass through untouched, which keeps it safe anywhere in a
+    pipeline (`trim|cast_int`, say).
+    """
+    return value.strip() if isinstance(value, str) else value
 
 
 def _cast(pytype: type, value: Any, transform: str) -> Any:
@@ -120,6 +189,39 @@ def _apply_enum(transform: str, value: Any) -> Any:
     )
 
 
+def _apply_truncate(transform: str, value: Any) -> str:
+    """`truncate:<n>` caps a string at n characters.
+
+    For the case where a `varchar(n)` target is narrower than a handful of
+    legacy values and widening the column is not an option (it would diverge
+    from the Django model that owns the schema). Without it, a single
+    over-long value aborts the entire COPY:
+
+        ERROR: value too long for type character varying(32)
+        CONTEXT: COPY accounts, line 438, column reference_code: "..."
+
+    and the field cannot simply be left unmapped when the column is NOT NULL.
+
+    This is deliberately NOT automatic. A transform that silently trimmed
+    every over-long value to fit would be precisely the quiet corruption this
+    tool exists to prevent — row counts would match while values were subtly
+    wrong. Writing `truncate:32` in the mapping makes the loss a declared
+    decision, visible in review, at one named field. `validate` applies the
+    same transform to the source side, so a truncated value is not reported
+    as a mismatch; the mapping file is the record of what was given up.
+    """
+    raw = transform[len("truncate:") :]
+    try:
+        limit = int(raw)
+    except ValueError as e:
+        raise TransformError(f"truncate: expected an integer length, got {raw!r}") from e
+    if limit <= 0:
+        raise TransformError(f"truncate: length must be positive, got {limit}")
+    if not isinstance(value, str):
+        raise TransformError(f"truncate: expected a string, got {value!r} ({type(value).__name__})")
+    return value[:limit]
+
+
 def _apply_split(transform: str, value: Any) -> list:
     """`split:<delimiter>` turns a delimited string into a list — for a
     source field like a comma-separated tag string landing on a Postgres
@@ -140,17 +242,37 @@ def _apply_split(transform: str, value: Any) -> list:
 
 
 def apply_default(transform: str | None, value: Any) -> Any:
-    """`default:<literal>` only kicks in when the resolved value is None."""
-    if value is not None or not transform or not transform.startswith("default:"):
+    """`default:<literal>` only kicks in when the resolved value is None.
+
+    Also finds a `default:` step inside a PIPELINE ("default:X|truncate:32"),
+    so the two compose. The literal is returned verbatim, exactly as before —
+    it is deliberately NOT fed through the pipeline's remaining steps, because
+    a default is authored to be the final value already (and tests pin the raw
+    string form: apply_default("default:0", None) == "0").
+    """
+    if value is not None or not transform:
         return value
-    return transform.split(":", 1)[1]
+    for step in split_pipeline(transform):
+        if step.startswith("default:"):
+            return step.split(":", 1)[1]
+    return value
 
 
 def _cast_timestamptz(value: Any) -> datetime.datetime:
     if isinstance(value, datetime.datetime):
         return value if value.tzinfo else value.replace(tzinfo=datetime.UTC)
     if isinstance(value, str):
-        parsed = datetime.datetime.fromisoformat(value)
+        # `fromisoformat` raises a bare ValueError on anything it dislikes —
+        # the empty string included, which legacy exports are full of. That
+        # escaped this module entirely and killed the whole run with a raw
+        # traceback, instead of being reported as a per-field violation the way
+        # every other failed cast is (`_cast` already wraps its own errors).
+        # Dry-run especially is meant to COLLECT these: crashing on the first
+        # one hides every other problem behind it.
+        try:
+            parsed = datetime.datetime.fromisoformat(value)
+        except ValueError as e:
+            raise TransformError(f"cast_timestamptz: cannot cast {value!r} (str): {e}") from e
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=datetime.UTC)
     raise TransformError(f"cast_timestamptz: cannot cast {value!r} ({type(value).__name__})")
 

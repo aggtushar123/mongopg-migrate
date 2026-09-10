@@ -49,8 +49,8 @@ def test_cast_int_and_float_and_text_and_bool():
     assert apply_transform("cast_bool", 1) is True
 
 
-# --- cast_* on a list/dict: found live re-verifying the an earlier review
-# transcript's "arrays of plain scalars" note. int()/float() already raise
+# --- cast_* on a list/dict: found live re-verifying an earlier
+# review's "arrays of plain scalars" note. int()/float() already raise
 # on a list on their own, but bool()/str() don't: bool([1, 2, 3]) is True
 # (any non-empty list is truthy) and str([1, 2, 3]) silently lands the
 # Python repr '[1, 2, 3]' in a text column — same footgun class as the

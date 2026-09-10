@@ -398,6 +398,23 @@ class FilterSpec(BaseModel):
 class EntityMapping(BaseModel):
     source: str
     target: str
+    # Extra load-order edges that the `lookup:` graph cannot infer.
+    #
+    # entity_dependencies() derives ordering purely from `lookup:` targets, so
+    # a lookup pointing at an entity OUTSIDE this mapping (an
+    # `external_entities` name resolved through hand-seeded id_map rows)
+    # produces NO edge at all — the entity floats to the front of the order and
+    # its COPY hits parent rows that do not exist yet:
+    #     hospital_bed_details / hospital_documents resolve a
+    #     HospitalDetails._id through a seeded lookup, but their FK is to
+    #     `hospitals`, which the graph never saw them needing.
+    #     ERROR: insert or update on table "hospital_bed_details" violates
+    #            foreign key constraint ... is not present in table "hospitals"
+    # Naming the dependency here fixes the order without distorting the data
+    # model (the alternative — filing the seeded rows under the `hospitals`
+    # entity to manufacture an edge — makes report/validate.py re-fetch those
+    # source_ids as Hospital documents and report every one as missing).
+    depends_on: list[str] = Field(default_factory=list)
     id_strategy: IdStrategy
     fields: dict[str, FieldSpec] = Field(default_factory=dict)
     explode: dict[str, ExplodeSpec] = Field(default_factory=dict)
@@ -438,6 +455,20 @@ class EntityMapping(BaseModel):
             | self.unmapped.dispositioned
             | {"_id"}  # always accounted for via id_strategy
         )
+
+    def lookup_entities(self) -> set[str]:
+        """Every entity name this one resolves a `lookup:` against, at any
+        level. The per-entity half of MappingFile.entity_dependencies(), minus
+        `depends_on` — a declared ordering edge is not a lookup and resolves
+        nothing, so prefetching it would read a map that is never consulted.
+
+        Used by migrate/load.py to bulk-load those maps once per entity load
+        instead of one round trip per lookup per row.
+        """
+        names = {f.lookup for f in self.fields.values() if f.lookup}
+        names |= _explode_lookup_targets(self.explode)
+        names |= {j.child_fk.lookup for j in self.junction.values() if j.child_fk.lookup}
+        return names
 
     def mongo_filter(self) -> dict:
         """The base Mongo query this entity's documents must always match —
@@ -520,6 +551,8 @@ class MappingFile(BaseModel):
             for junc in entity.junction.values():
                 if junc.child_fk.lookup:
                     deps[name].add(junc.child_fk.lookup)
+            # Declared edges the lookup graph cannot see — see EntityMapping.depends_on.
+            deps[name] |= set(entity.depends_on)
         return deps
 
     def entity_load_order(self) -> list[str]:
@@ -628,6 +661,33 @@ def validate_structure(mapping: MappingFile) -> list[ValidationIssue]:
             )
         )
 
+    def _check_depends_on(name: str, entity: EntityMapping) -> None:
+        # Must name an entity in THIS file. Unlike `lookup:`, an external name
+        # would be meaningless — the point of depends_on is to order two
+        # entities within this run, and entity_load_order() only sorts local
+        # entities. An unknown name there is silently satisfied (it never
+        # intersects `remaining`), so without this check a typo would quietly
+        # restore the very load-order bug depends_on exists to fix.
+        for dep in entity.depends_on:
+            if dep == name:
+                issues.append(
+                    ValidationIssue(
+                        severity="error", entity=name, field="depends_on",
+                        message=f"depends_on lists the entity itself ({dep!r}) — an entity cannot "
+                        "be ordered before itself",
+                    )
+                )
+            elif dep not in entity_names:
+                issues.append(
+                    ValidationIssue(
+                        severity="error", entity=name, field="depends_on",
+                        message=f"depends_on: {dep!r} is not an entity in this mapping file "
+                        f"(known: {sorted(entity_names)}). depends_on orders entities WITHIN one "
+                        "run, so an `external_entities` name is not valid here — it is already "
+                        "loaded.",
+                    )
+                )
+
     def _check_explode_lookups(name: str, path: str, explode: dict[str, ExplodeSpec]) -> None:
         for ename, exp in explode.items():
             full_path = f"{path}.{ename}" if path else ename
@@ -641,6 +701,7 @@ def validate_structure(mapping: MappingFile) -> list[ValidationIssue]:
         _check_explode_lookups(name, "", entity.explode)
         for jname, junc in entity.junction.items():
             _check_lookup(name, jname, junc.child_fk.lookup)
+        _check_depends_on(name, entity)
     return issues
 
 

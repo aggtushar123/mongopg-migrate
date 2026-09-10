@@ -6,3 +6,7 @@ __pycache__/
 .ruff_cache/
 mapping.yaml
 .env
+
+# Never commit a real connection string or credential file.
+*.env
+!*.env.template

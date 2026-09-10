@@ -43,6 +43,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
@@ -139,6 +140,35 @@ def _table_count(conn: psycopg.Connection, table: str) -> int:
         return n
 
 
+def _idmap_row_count(conn: psycopg.Connection, entity_name: str, *, schema: str) -> int:
+    """How many rows THIS entity loaded, from its own id_map rows.
+
+    Needed when several entities write the SAME target table, where a plain
+    `count(*)` on the table is not that entity's row count and the comparison
+    is meaningless:
+
+        [MISMATCH] sessions_user     (sessions): mongo=890 postgres=1365
+        [MISMATCH] sessions_hospital (sessions): mongo=476 postgres=1365
+
+    — 889 + 476 = 1365 was exactly right, but each entity was being compared
+    against both entities' rows. This affects any polymorphic split: two
+    collections landing in one table (Session / hospitalSession -> sessions),
+    or one collection split by `filter:` into several entities (PRD §7).
+
+    Every top-level entity writes one id_map row per loaded document, so this
+    counts precisely the rows the entity is responsible for. It is used ONLY
+    for shared targets: with a table to itself, count(*) stays the better
+    check, because it also notices rows that should not be there at all.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f'SELECT count(*) FROM "{schema}"."{idmap.TABLE_NAME}" WHERE entity = %s',
+            (entity_name,),
+        )
+        (n,) = cur.fetchone()
+        return n
+
+
 def _sum_array_length(db: Database, collection: str, field_name: str, mongo_filter: dict) -> int:
     pipeline = [
         *([{"$match": mongo_filter}] if mongo_filter else []),
@@ -213,7 +243,8 @@ def _skip_row_reduction(
     row has more than one independently-dangling skip_row field, each is
     counted here but the row is only ever actually dropped once — this can
     over-subtract in that (rare — most mappings have at most one lookup
-    field prone to going dangling) case. A junction's skip_row reduction
+    field prone to going dangling) case. Counting is per ROW, not per
+    distinct value — see _mongo_value_occurrences. A junction's skip_row reduction
     doesn't share this risk (one child_fk per row) and isn't computed
     here — see the junction branch in _count_diffs."""
     total = 0
@@ -225,9 +256,61 @@ def _skip_row_reduction(
         else:
             id_map_conn, id_map_schema = conn, internal_schema
         known = _known_source_ids(id_map_conn, fspec.lookup, schema=id_map_schema)
-        present = _mongo_present_scalar_values(db, entity.source, explode_path, key, mongo_filter)
-        total += len(present - known)
+        occurrences = _mongo_value_occurrences(db, entity.source, explode_path, key, mongo_filter)
+        # Sum the ROWS carrying a dangling value, not the number of distinct
+        # dangling values — several rows routinely share one.
+        total += sum(n for value, n in occurrences.items() if value not in known)
+
+        # A document can also be dropped for having NO value in the field at
+        # all, but only when that field is what establishes the row's identity:
+        # migrate/load.py skips those rather than failing the run, precisely
+        # because the mapping already declared skip_row on the field. An absent
+        # value is not a dangling one, so the occurrence counts above never see
+        # it, and the expectation came up one short:
+        #     [MISMATCH] booking_payment_details: mongo=12887 postgres=8199
+        #                (-4687 expected)   # 12887 - 4687 = 8200, not 8199
+        # — one PaymentDetails document has no bookingId at all (it is a stray
+        # patient record that landed in the payments collection).
+        if explode_path is None and key == entity.id_strategy.source_field:
+            total += db[entity.source].count_documents({**mongo_filter, key: {"$in": [None, ""]}})
     return total
+
+
+def _entity_skipped_doc_ids(
+    db: Database,
+    conn: psycopg.Connection,
+    entity: EntityMapping,
+    *,
+    mongo_filter: dict,
+    internal_schema: str,
+    external_conns: dict[str, psycopg.Connection] | None,
+) -> set:
+    """`_id`s of documents the loader drops wholesale via an entity-level
+    `on_missing: skip_row`.
+
+    Needed because a skipped DOCUMENT takes its `explode` / `junction` /
+    `unpivot` children with it (load.py raises SkipRowError before any child
+    row is appended), while the count diff only ever subtracted the parent
+    row. A single skipped hospital_details was enough to fail an otherwise
+    perfect migration:
+        [MISMATCH] hospital_details.facilities: mongo=14830 postgres=14829
+    — the one document's facility rows were never written, correctly, but
+    nothing told the count diff to expect that.
+    """
+    skipped: set = set()
+    for key, fspec in entity.fields.items():
+        if not fspec.lookup or fspec.on_missing != OnMissing.SKIP_ROW:
+            continue
+        if fspec.lookup in (external_conns or {}):
+            id_map_conn, id_map_schema = external_conns[fspec.lookup], idmap.DEFAULT_SCHEMA_NAME
+        else:
+            id_map_conn, id_map_schema = conn, internal_schema
+        known = _known_source_ids(id_map_conn, fspec.lookup, schema=id_map_schema)
+        for doc in db[entity.source].find(mongo_filter or {}, {key: 1}):
+            raw = get_nested(doc, key)
+            if raw is not None and str(raw) not in known:
+                skipped.add(doc["_id"])
+    return skipped
 
 
 def _count_diffs(
@@ -239,6 +322,10 @@ def _count_diffs(
     external_conns: dict[str, psycopg.Connection] | None = None,
 ) -> list[CountDiff]:
     diffs: list[CountDiff] = []
+    # Targets written by more than one entity — see _idmap_row_count.
+    shared_targets = {
+        t for t, n in Counter(e.target for e in mapping.entities.values()).items() if n > 1
+    }
     for name, entity in mapping.entities.items():
         # entity.mongo_filter() matters here specifically: without it, a
         # discriminator-filtered entity (PRD §7 P0) would count every OTHER
@@ -255,10 +342,22 @@ def _count_diffs(
                 entity=name,
                 table=entity.target,
                 mongo_count=db[entity.source].count_documents(mongo_filter),
-                postgres_count=_table_count(conn, entity.target),
+                postgres_count=(
+                    _idmap_row_count(conn, name, schema=internal_schema)
+                    if entity.target in shared_targets
+                    else _table_count(conn, entity.target)
+                ),
                 expected_skip=entity_skip,
             )
         )
+        # Children of documents dropped by an entity-level skip_row are never
+        # written either — see _entity_skipped_doc_ids.
+        skipped_ids = _entity_skipped_doc_ids(
+            db, conn, entity, mongo_filter=mongo_filter,
+            internal_schema=internal_schema, external_conns=external_conns,
+        )
+        skipped_filter = {**mongo_filter, "_id": {"$in": list(skipped_ids)}} if skipped_ids else None
+
         for path, exp in _flatten_explode(entity.explode):
             explode_skip = _skip_row_reduction(
                 db, conn, entity, exp.fields, explode_path=path, mongo_filter=mongo_filter,
@@ -270,7 +369,10 @@ def _count_diffs(
                     table=exp.target,
                     mongo_count=_sum_nested_array_length(db, entity.source, path, mongo_filter),
                     postgres_count=_table_count(conn, exp.target),
-                    expected_skip=explode_skip,
+                    expected_skip=explode_skip + (
+                        _sum_nested_array_length(db, entity.source, path, skipped_filter)
+                        if skipped_filter else 0
+                    ),
                 )
             )
         for jname, junc in entity.junction.items():
@@ -289,7 +391,10 @@ def _count_diffs(
                     table=junc.target,
                     mongo_count=_sum_array_length(db, entity.source, jname, mongo_filter),
                     postgres_count=_table_count(conn, junc.target),
-                    expected_skip=junction_skip,
+                    expected_skip=junction_skip + (
+                        _sum_array_length(db, entity.source, jname, skipped_filter)
+                        if skipped_filter else 0
+                    ),
                 )
             )
         for uname, unp in entity.unpivot.items():
@@ -299,6 +404,10 @@ def _count_diffs(
                     table=unp.target,
                     mongo_count=_sum_unpivot_rows(db, entity.source, unp, mongo_filter),
                     postgres_count=_table_count(conn, unp.target),
+                    expected_skip=(
+                        _sum_unpivot_rows(db, entity.source, unp, skipped_filter)
+                        if skipped_filter else 0
+                    ),
                 )
             )
     return diffs
@@ -337,6 +446,37 @@ def _canonicalize(value: Any) -> Any:
     if isinstance(value, list):
         return [_canonicalize(v) for v in value]
     return value
+
+
+def _match_stored_scale(recomputed: Any, actual: Any) -> Any:
+    """Round a recomputed number to the scale the target column actually kept.
+
+    A Mongo float carries binary noise that a `numeric(p,s)` column silently
+    rounds away on the way in. The database is right and the comparison was
+    wrong:
+
+        Mongo    91967.50000000001   (BSON double)
+        Postgres 91967.50            (numeric(14,2))
+        -> [MISMATCH] statements source_id=...: amount
+
+    Nothing was lost or corrupted — the column is defined to two decimal
+    places — but every such row reported as a value mismatch, which buries
+    the real ones. The stored value's own exponent tells us the scale, so no
+    extra schema introspection is needed. Only applied when Postgres returned
+    a Decimal with a fixed scale: an integer-valued Decimal (exponent >= 0)
+    is left alone so a genuine 1 vs 1.4 difference still shows up.
+    """
+    if not isinstance(actual, Decimal) or not isinstance(recomputed, (int, float, Decimal)):
+        return recomputed
+    if isinstance(recomputed, bool):
+        return recomputed
+    exponent = actual.as_tuple().exponent
+    if not isinstance(exponent, int) or exponent >= 0:
+        return recomputed
+    try:
+        return Decimal(str(recomputed)).quantize(actual)
+    except (ArithmeticError, ValueError):
+        return recomputed
 
 
 def _row_hash(values: list) -> str:
@@ -382,7 +522,16 @@ def _recompute_field_value(
     raw = get_nested(doc, key)
     if fspec.lookup:
         if raw is None:
-            return None
+            # An ABSENT source value is not a dangling reference — there is
+            # nothing to resolve — so a `default:` on the same field still
+            # applies, exactly as migrate/load.py does it (load.py calls
+            # apply_default on the lookup's result, not just on the transform
+            # branch below). Returning a bare None here instead reported a
+            # mismatch on every row the default correctly filled:
+            #     [MISMATCH] bookings source_id=...: insuranceCompanyId
+            # — the 547 self-pay bookings whose absent insuranceCompanyId
+            # resolves to the CASH insurance company.
+            return apply_default(fspec.transform, None)
         # Same rule as migrate/load.py's _resolve_lookup: a cross-database
         # external entity always uses its own database's real, default
         # schema — never this run's own internal_schema.
@@ -394,7 +543,18 @@ def _recompute_field_value(
             id_map_schema = internal_schema
         target_id_str = idmap.get(id_map_conn, fspec.lookup, str(raw), schema=id_map_schema)
         if target_id_str is None:
-            return None if fspec.on_missing == OnMissing.NULL else _LOOKUP_MISSING
+            if fspec.on_missing != OnMissing.NULL:
+                return _LOOKUP_MISSING
+            # `on_missing: null` rescues the dangling reference, and load.py
+            # then runs apply_default over that result like any other — so
+            # `on_missing: null` + `default:` together mean "send a dangling
+            # reference to this placeholder". Returning a bare None here
+            # ignored the default and reported a mismatch on every row it
+            # correctly filled:
+            #     [MISMATCH] kyc_info source_id=...: mcmUserId
+            # for the 2759 KYC records whose deleted author resolves to the
+            # "Deleted User" row.
+            return apply_default(fspec.transform, None)
         col_type = pg_schema.tables[target_table].columns[fspec.target].data_type.lower()
         return _cast_for_column(target_id_str, col_type)
     value = apply_transform(fspec.transform, raw)
@@ -465,6 +625,14 @@ def _sample_diffs(
                 continue
             actual = list(row)
 
+            # Align float-vs-numeric scale before comparing — see
+            # _match_stored_scale. Done here, against the actual row, rather
+            # than inside _canonicalize, which sees one value at a time and
+            # cannot know what scale the column kept.
+            recomputed = [
+                _match_stored_scale(r, a) for r, a in zip(recomputed, actual, strict=False)
+            ]
+
             if _row_hash(recomputed) == _row_hash(actual):
                 continue
 
@@ -490,6 +658,34 @@ def _known_source_ids(conn: psycopg.Connection, lookup_entity: str, *, schema: s
     with conn.cursor() as cur:
         cur.execute(f'SELECT source_id FROM "{schema}".id_map WHERE entity = %s', (lookup_entity,))
         return {row[0] for row in cur.fetchall()}
+
+
+def _mongo_value_occurrences(
+    db: Database, collection: str, explode_path: str | None, field_name: str, mongo_filter: dict
+) -> dict[str, int]:
+    """value -> HOW MANY rows carry it, not just which values exist.
+
+    `_skip_row_reduction` used the distinct-value set for this and so
+    under-counted every time several documents share one dangling reference:
+
+        [MISMATCH] booking_docs: mongo=18064 postgres=11456 (-1903 expected)
+
+    6608 BookingDocs point at a deleted Booking, but only 1903 DISTINCT
+    booking ids among them — so the expectation was short by 4705 and a
+    correct migration failed validation. What has to be subtracted is the
+    number of ROWS dropped, which is the sum of these counts.
+    """
+    pipeline = [*([{"$match": mongo_filter}] if mongo_filter else [])]
+    prefix = ""
+    if explode_path:
+        segments = explode_path.split(".")
+        for i in range(len(segments)):
+            pipeline.append({"$unwind": f"${'.'.join(segments[: i + 1])}"})
+        prefix = f"{explode_path}."
+    full_field = f"{prefix}{field_name}"
+    pipeline.append({"$match": {full_field: {"$ne": None}}})
+    pipeline.append({"$group": {"_id": f"${full_field}", "n": {"$sum": 1}}})
+    return {str(d["_id"]): d["n"] for d in db[collection].aggregate(pipeline)}
 
 
 def _mongo_present_scalar_values(
