@@ -50,10 +50,52 @@ TRANSFORM_PIPE = "|"
 
 def split_pipeline(transform: str | None) -> list[str]:
     """Split a transform spec into its steps. A spec with no pipe is a
-    one-step pipeline, so every caller can treat the two uniformly."""
+    one-step pipeline, so every caller can treat the two uniformly.
+
+    Splits only on a `|` at JSON nesting depth 0 and outside a JSON string,
+    because `enum:` carries a JSON object that may legitimately contain one.
+    A naive `transform.split("|")` cut straight through it, so
+
+        enum:{"A|B": "both"}
+
+    was chopped into `enum:{"A` and `B": "both"}` and failed with an
+    unterminated-string JSON error that named neither the pipeline nor the
+    pipe — and did so even when `enum:` was the ONLY transform on the field,
+    since two steps is what sends a spec down the pipeline path at all.
+    """
     if not transform:
         return []
-    return [step.strip() for step in transform.split(TRANSFORM_PIPE) if step.strip()]
+
+    steps: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_string = False
+    escaped = False
+
+    for ch in transform:
+        if in_string:
+            buf.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in "{[":
+            depth += 1
+        elif ch in "}]":
+            depth -= 1
+        elif ch == TRANSFORM_PIPE and depth <= 0:
+            steps.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+
+    steps.append("".join(buf))
+    return [step.strip() for step in steps if step.strip()]
 
 
 def apply_transform(transform: str | None, value: Any) -> Any:
@@ -235,7 +277,12 @@ def _apply_split(transform: str, value: Any) -> list:
     """
     delimiter = transform[len("split:") :]
     if not delimiter:
-        raise TransformError("split: needs a non-empty delimiter, e.g. `split:,`")
+        raise TransformError(
+            "split: needs a non-empty delimiter, e.g. `split:,`. If you meant a literal "
+            "pipe (`split:|`), it cannot be combined with other steps: `|` is also the "
+            "pipeline separator, so the delimiter is consumed as a step boundary. Use "
+            "`split:|` on its own, which is unambiguous and works."
+        )
     if not isinstance(value, str):
         raise TransformError(f"split: expected a string, got {value!r} ({type(value).__name__})")
     return value.split(delimiter)

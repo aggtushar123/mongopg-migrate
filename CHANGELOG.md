@@ -11,6 +11,25 @@ under **Changed** with a migration note.
 
 ## [Unreleased]
 
+### Fixed
+
+- A `|` inside an `enum:` JSON object was treated as a pipeline separator, so
+  `enum:{"A|B": "both"}` was chopped mid-JSON and failed with an
+  unterminated-string error naming neither the pipeline nor the pipe — and did
+  so even when `enum:` was the only transform on the field, since two steps is
+  what sends a spec down the pipeline path at all. Splitting is now aware of
+  JSON nesting and strings. `split:` on a literal pipe combined with other
+  steps remains ambiguous by construction, and now says so.
+
+### Added
+
+- Tests for the features that shipped in 0.1.1 without any: transform
+  pipelines, `truncate:`, `trim`, `depends_on:`, and the id_map
+  prefetch/`put_many` fast path (72 tests).
+- README documentation for all of the above — the Transform DSL section had
+  not been updated for `truncate:`/`trim`/pipelines, and `depends_on:` was
+  documented nowhere.
+
 ## [0.1.1] — 2026-09-10
 
 First published release. `0.1.0` existed in `pyproject.toml` but was never

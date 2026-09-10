@@ -51,6 +51,10 @@ Early, pre-alpha. Implemented so far:
 | Unmapped-field policy, one level down: `ExplodeSpec` now carries its own `unmapped: {drop, jsonb, jsonb_column}` — same shape, same real-jsonb-landing guarantee as the top-level `EntityMapping.unmapped` — and `validate-mapping --mongo-uri` checks fields *inside* every exploded array item against it, recursively through nested `explode`. Found the same way as collection coverage: re-reading the *earliest* PRD design review verbatim (written before any code existed) turned up "nested-path unmapped checks inside exploded objects... acceptable to decide in code" — a question that was flagged, never actually decided, for the entire life of the project | ✅ — live-tested: `items[].discount`/`items[].note` with no disposition correctly blocked `validate-mapping`; adding `unmapped: {jsonb: [discount, note], jsonb_column: extra}` cleared it, and `migrate` landed the real values per row (`{"note": "gift wrap", "discount": 0.1}` / `{"note": null, "discount": 0}`) — not just accepted as a label; a misconfigured `jsonb_column` name hard-fails `migrate` before any write, mirroring the top-level check exactly; the base demo fixture (fully mapped, nothing to flag) still passes with zero new warnings |
 | Nested `lookup:` invisible to load ordering — a real bug an external reviewer found and reproduced against this exact code, then reproduced again after a fix attempt to confirm it: `entity_dependencies()`/`entity_load_order()` and `validate_structure()` only ever iterated one explode level's own `.fields`, so a `lookup:` one level deeper (`facilities[].categoryParts[].lookup: zcategories`) was invisible to both — wrong load order (unenforced by `entity_load_order()`), and a typo'd nested `lookup:` name passed `validate_structure()` with zero issues. **`on_missing` made the load-order half of this silent, not just wrong**: before `on_missing` existed, an empty id_map from the wrong order was a loud `LoadError`; with `on_missing: null`, every reference then quietly writes NULL, count diff is unaffected (NULLs don't change row counts), `validate`'s own `_count_on_missing` re-derives against the by-then-fully-loaded id_map and reports zero dangling refs, and `validate` reports OK — an all-NULL FK column that passes every check. Fixed at both the cause and the blast radius: `entity_dependencies()`/`validate_structure()` now recurse through nested `explode` (root cause); independently, `_resolve_lookup` now refuses to apply *any* `on_missing` policy when the referenced entity's id_map has zero rows at all — cached per entity, one extra indexed query on the first miss, not per miss — since a policy for one dangling reference is not a correct answer to "this entity never loaded," whether from the ordering bug just fixed or a forgotten prerequisite run (`external_entities` naming a migration nobody actually ran) that no amount of correct-ordering logic *can* catch | ✅ — live-tested all three shapes: the exact reported reproduction (`entity_dependencies()`/`entity_load_order()` now correctly order `zcategories` before `hospitals`, migrated end to end with the nested FK correctly resolved, not NULL); a simulated forgotten-prerequisite-run (`external_entities` naming a migration that was never run, `on_missing: null`) now hard-fails with a message distinguishing "load-order problem" from a real dangling reference, instead of silently writing NULL; a genuinely dangling individual reference (the entity has other rows, just not this one) still correctly nulls as designed — confirming the fix narrows precisely, not just broadly |
 | Live integration tests in CI (`tests/integration/`, its own CI job with real Mongo/Postgres service containers): the "live-tested" claims scattered through this table were previously proven once, by hand, in a dev session, and never re-checked — another old review, re-read verbatim: "consider capturing them as a compose-based integration test so CI proves them, not prose." A first slice: the full `validate-mapping`→`dry-run`→`migrate`→`validate` loop through the actual CLI (`CliRunner`, real Mongo + real Postgres, PRD §12's own worked example), and a genuine SIGKILL-mid-migrate-then-resume test — a real subprocess, killed via polling for actual partial progress (not a guessed sleep), asserting zero duplicates and zero gaps after resuming. Skipped cleanly (not failed) when `MONGO_URI`/`POSTGRES_URI` aren't set, so the plain unit-test suite stays exactly as fast as before | ✅ — both pass reliably against local Docker (3/3 repeated runs, no flakes) and now run in CI on every push |
+| `--pg-schema` honoured on the WRITE path, not just introspection: it now sets `search_path` explicitly for `migrate`/`dry-run`/`validate`, and a schema that does not exist is reported rather than read as an empty target | ✅ — CI-proven: `tests/test_target_schema.py` (11) + `tests/integration/test_target_schema_live.py` (4, real Postgres). The live tests put an identically-named decoy table in `public`, and all four were confirmed to fail against the pre-fix code |
+| Transform pipelines (`a\|b`, left to right) plus the `truncate:<n>` and `trim` transforms — one field can need two unrelated fixes and `transform:` has one slot | ✅ — CI-proven: `tests/test_transform_pipeline.py` (37), including the `default:`-is-not-re-piped edge and a `\|` inside an `enum:` JSON object |
+| `depends_on:` — a declared load-order edge the `lookup:` graph cannot infer (an FK resolved through hand-seeded `external_entities` rows names no `lookup:`, so it floated to the front and COPYed before its parent) | ✅ — CI-proven: `tests/test_depends_on.py` (14), covering ordering, union with lookup-derived edges, cycles, and the typo/self-reference/external-name validation |
+| id_map bulk `prefetch()` + batched `put_many()`: `get()` was one network round trip per `lookup:` per row, which over a VPN set the pace for the whole migration | ✅ — CI-proven: `tests/test_idmap_prefetch.py` (21), covering write-through, per-connection/schema/entity keying, weakref cleanup, chunking under Postgres's placeholder cap, and that a snapshot miss does NOT fall through to a query |
 
 ## Install
 
@@ -200,10 +204,17 @@ the Status table above.
 
 ### Transform DSL
 
-`FieldSpec.transform` supports `cast_int`/`cast_float`/`cast_text`/`cast_bool`/`cast_timestamptz`,
-`default:<literal>`, `json_extract:<path>` (informational — the dotted
-field key already resolves this), `enum:<json mapping>`, and
-`split:<delimiter>`:
+`FieldSpec.transform` supports:
+
+| Transform | Does |
+|---|---|
+| `cast_int` `cast_float` `cast_text` `cast_bool` `cast_timestamptz` | Type coercion. All reject a list/dict loudly rather than coercing it. |
+| `default:<literal>` | Used only when the resolved value is `None`. |
+| `enum:<json mapping>` | Remaps a value through an explicit table. `"*"` is a fallback; an unlisted value without one is an error. |
+| `split:<delimiter>` | Delimited string → list, for a Postgres `ARRAY` column. |
+| `truncate:<n>` | Caps a string at `n` characters. |
+| `trim` | Strips leading/trailing whitespace. |
+| `json_extract:<path>` | Informational — the dotted field key already resolves this. |
 
 ```yaml
 fields:
@@ -215,6 +226,65 @@ fields:
 
 `enum:` is the one most Prisma/ORM migrations end up needing — a stored
 enum whose labels don't match the target column's labels verbatim.
+
+#### Pipelines
+
+Steps separated by `|` run left to right, because one field can need two
+unrelated fixes and `transform:` has only one slot:
+
+```yaml
+fields:
+  # absent on some documents, over-long on others, and the column is NOT NULL
+  hlNumber: { target: reference_code, transform: "default:UNKNOWN|truncate:32" }
+  # pad-stripped, then parsed
+  qtyText:  { target: qty, transform: "trim|cast_int" }
+```
+
+Three things worth knowing:
+
+- **`truncate:` is never automatic.** A transform that silently trimmed every
+  over-long value to fit would be the quiet corruption this tool exists to
+  prevent — counts would match while values were subtly wrong. Writing
+  `truncate:32` makes the loss a declared decision at one named field, visible
+  in review. `validate` applies the same transform to the source side, so a
+  truncated value is not reported as a mismatch; the mapping file is the
+  record of what was given up.
+- **`trim` removes padding, never content.** Internal whitespace is left
+  alone: collapsing `Liberty  General` is a normalisation decision that
+  belongs in a lookup table, not a field transform.
+- **A `default:` literal is not put through the rest of the pipeline.** It is
+  authored to be the final value, so `default:LONGVALUE|truncate:3` yields
+  `LONGVALUE`, not `LON` — a default longer than the column will still fail
+  the load. Write a default that already fits.
+
+A `|` inside an `enum:` JSON object is not a step separator, so
+`enum:{"A|B": "both"}` works. The one case the syntax cannot express is
+`split:` on a literal pipe *combined with other steps* — `split:|` alone is
+fine, `trim|split:|` is ambiguous and says so.
+
+### Load order
+
+`migrate` derives the order from the mapping: every `lookup:` is an edge, and
+referenced entities load first. A cycle is an error rather than a guess.
+
+`depends_on:` declares an edge the graph cannot infer — the case being a
+foreign key whose value is resolved through hand-seeded `external_entities`
+id_map rows, so the entity never names its parent in a `lookup:` at all and
+would otherwise float to the front and `COPY` before the parent exists:
+
+```yaml
+entities:
+  hospital_documents:
+    source: hospitalDocuments
+    target: hospital_documents
+    depends_on: [hospitals]     # FK is to hospitals; no lookup: names it
+```
+
+It orders entities **within one run**, so it must name an entity in the same
+mapping file — an `external_entities` name is rejected, since that data is
+already loaded. A name that is not in the file is an error too: at ordering
+time an unknown name is trivially satisfied, so a typo would silently restore
+the exact bug `depends_on` exists to fix.
 
 ### Docker (primary distribution, per PRD §8)
 
