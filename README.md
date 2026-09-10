@@ -19,7 +19,7 @@ reference PRD section numbers throughout.
 **Alpha.** The core loop — `introspect` → `propose` → `validate-mapping` →
 `dry-run` → `migrate` → `validate` — works end to end and is exercised on
 every push against real MongoDB and PostgreSQL containers: over 340 unit
-tests and 6 live integration tests.
+tests and 20 live integration tests.
 
 It has been used for one large real migration, which is where most of its
 sharp edges came from. It has not been used by anyone else yet, so
@@ -41,9 +41,9 @@ target schema before you trust it with anything you cannot rebuild.
 | `validate` — count diff plus hashed-field sample diff | `test_validate_canonicalize.py` (12) + live |
 | `--pg-schema` honoured on read **and** write | `test_target_schema.py` (11) + live (4) |
 | `mongopg-fanin` — the fan-in (N docs → 1 row) helper | `test_fanin_reshape.py` (21); `$merge` path hand-verified |
-| `--mode upsert` | ⚠️ unit tests cover SQL generation only, never a live Postgres |
+| `--mode upsert` — staging table + `ON CONFLICT` | `test_load_upsert.py` (4), `integration/test_upsert_live.py` (6) |
 | Docker image | ⚠️ hand-verified; built multi-arch by `release.yml`, but no test asserts it behaves |
-| `append`/`upsert` resuming an entity already marked `done` | ❌ **no test covers this** |
+| `append`/`upsert` resuming an entity already marked `done` | `integration/test_resume_done_entity_live.py` (8) |
 
 Each row links to the tests that back it, and only to tests that exist. The
 detailed history behind these — the bugs, why each fix is shaped the way it
@@ -256,6 +256,31 @@ A `|` inside an `enum:` JSON object is not a step separator, so
 `enum:{"A|B": "both"}` works. The one case the syntax cannot express is
 `split:` on a literal pipe *combined with other steps* — `split:|` alone is
 fine, `trim|split:|` is ambiguous and says so.
+
+### Re-running a migration
+
+`--mode truncate` empties the mapped tables and starts over. `append` and
+`upsert` keep what is there and continue from a per-entity checkpoint. Three
+things about the second case are worth knowing before you rely on it for a
+cutover:
+
+- **A completed entity resumes at `_id > last_source_id`.** New documents are
+  picked up on the next run; the checkpoint advances; a run with nothing new
+  reports "already fully loaded", writes nothing, and exits 0.
+- **A MODIFIED document is not picked up.** Editing a document does not change
+  its `_id`, so a re-run skips straight past it and reports success having
+  looked at nothing. This is not a failed update — the document is never read.
+  To re-pass over data that already loaded, clear the entity's checkpoint row
+  in `_mongopg.load_checkpoint`; `upsert` then rewrites the existing rows in
+  place.
+- **Re-processing a document duplicates its `explode` children.** Child rows
+  have no natural conflict key, so they are always plain-inserted, while the
+  parent row is upserted. `validate`'s count diff catches this (the child
+  table reports more rows than the source array holds), but the loader itself
+  will not complain. `junction` and `unpivot` rows do have natural keys and
+  are not affected.
+
+Run `validate` after any re-run, not just the first load.
 
 ### Load order
 

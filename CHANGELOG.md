@@ -31,6 +31,14 @@ under **Changed** with a migration note.
   documented nowhere.
 - `docs/engineering-log.md`, and `tests/test_doc_claims.py` (11) to keep the
   documentation's claims honest automatically.
+- Live tests for the two production paths that had none: `--mode upsert`
+  against a real Postgres (`integration/test_upsert_live.py`, 6) and resuming
+  an entity already marked `done` (`integration/test_resume_done_entity_live.py`,
+  8). The integration suite goes from 6 tests to 20.
+- A "Re-running a migration" README section, documenting two behaviours the
+  new tests surfaced: a MODIFIED source document is not picked up while the
+  entity's checkpoint stands, and re-processing a document duplicates its
+  `explode` children (which `validate` catches, but the loader does not).
 
 ### Changed
 

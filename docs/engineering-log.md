@@ -76,9 +76,13 @@ Observed: catches a real corrupted value with the exact field + row identified, 
 
 ## `--mode upsert`: staging table + `ON CONFLICT DO UPDATE` for the main entity and `junction` tables; `explode` children always plain-insert (no natural conflict key)
 
-**Automated (CI)** — `test_load_upsert.py` (4)
+**Automated against real Mongo + Postgres (CI)** — `test_load_upsert.py` (4), `integration/test_upsert_live.py` (6)
 
-SQL generation only — the upsert path is not exercised against a live Postgres.
+The live tests pin two behaviours the SQL alone does not show: a document
+MODIFIED in the source is not picked up while the entity's checkpoint stands
+(the run reports "already fully loaded" and exits 0), and re-processing a
+document duplicates its `explode` children, which `validate` then catches as
+a count mismatch.
 
 
 
@@ -126,9 +130,12 @@ Observed: two independent `migrate` runs against two separate mapping files, FK 
 
 ## `append`/`upsert` resuming a `done` entity: previously frozen after first completion — new documents inserted since required manually deleting the checkpoint row
 
-**Unverified — no test covers this**
+**Automated against real Mongo + Postgres (CI)** — `integration/test_resume_done_entity_live.py` (8)
 
-No test covers this. Nothing in `tests/` references resuming an entity already marked `done`; the behaviour rests on a single hand-run session.
+Covers both `append` and `upsert`: documents inserted after completion are
+picked up, the checkpoint advances, a run with nothing new is a clean no-op
+that writes nothing and does not move the checkpoint, and `validate` agrees
+afterwards. Re-freezing the entity — the original bug — fails 6 of the 8.
 
 
 Observed: new document picked up automatically on next run, "nothing new" case still reports cleanly
